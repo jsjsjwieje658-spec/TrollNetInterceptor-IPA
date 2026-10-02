@@ -258,7 +258,8 @@ static void AetherInstallHookPayload(void)
                       srcSize, signedSize);
         } else {
             AetherLog(@"[installer] fastPathSign rc=%d size=%llu — continuing with adhoc signature "
-                      @"(may be rejected by App Store targets)", signRc, signedSize);
+                      @"(Dopamine PPL bypass handles AMFI on live-attach path)",
+                      signRc, signedSize);
         }
         NSString *payloadDylib = workCopy; // install the (re)signed copy
         unsigned long long payloadSize = signedSize ?: srcSize;
