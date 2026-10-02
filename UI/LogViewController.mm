@@ -178,7 +178,7 @@
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Xóa" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        [AetherLogClear];
+        AetherLogClear();
         [self refreshLog];
         [self showToast:@"Log cleared"];
     }]];
