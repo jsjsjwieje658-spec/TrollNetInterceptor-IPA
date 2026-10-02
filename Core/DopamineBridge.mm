@@ -20,14 +20,16 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <xpc/xpc.h>
 #include "DopamineBridge.h"
 #include "AetherXpcPrivate.h"
 
 // ---------------------------------------------------------------------------
-// xpc types — use the real xpc_object_t from the SDK (not void *)
+// xpc types — forward-declare to avoid dependency on <xpc/xpc.h> which may
+// be missing from sparse SDKs (theos/iPhoneOS16.5). All xpc APIs resolve at
+// runtime from the always-loaded libxpc.dylib.
 // ---------------------------------------------------------------------------
-typedef xpc_object_t xpc_t;
+typedef objc_object *xpc_object_t_objc;  // opaque Obj-C type behind xpc_object_t
+typedef xpc_object_t_objc xpc_t;
 
 // ---------------------------------------------------------------------------
 // Dopamine jbserver domains & actions (jbserver_domains.h, branch 3.x)
