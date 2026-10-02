@@ -10,7 +10,7 @@
 //    xdict["jb-domain"] = uint64 domain
 //    xdict["action"]    = uint64 action
 //    …action args…
-//    → xpc_pipe_routine_with_flags(pipe_to_launchd, xdict, &xreply, 0)
+//    → AetherXpcPipeRoutineWithFlags(pipe_to_launchd, xdict, &xreply, 0)
 //    xreply["result"] = int64 (0 == success)
 //
 
@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <xpc/xpc.h>
 #include "DopamineBridge.h"
+#include "AetherXpcPrivate.h"
 
 // ---------------------------------------------------------------------------
 // xpc types — use the real xpc_object_t from the SDK (not void *)
@@ -71,20 +72,20 @@ static xpc_t AetherJBServerSend(uint64_t domain, uint64_t action, xpc_t xargs)
 
     mach_port_t launchdPort = MACH_PORT_NULL;
     if (AetherGetLaunchdPort(&launchdPort) != KERN_SUCCESS) {
-        if (ownsXargs) xpc_release(xargs);
+        if (ownsXargs) AetherXpcRelease(xargs);
         return NULL;
     }
 
-    xpc_t pipe = xpc_pipe_create_from_port(launchdPort, 0);
+    xpc_t pipe = AetherXpcPipeCreateFromPort(launchdPort, 0);
     if (!pipe) {
-        if (ownsXargs) xpc_release(xargs);
+        if (ownsXargs) AetherXpcRelease(xargs);
         return NULL;
     }
 
     xpc_t reply = NULL;
-    int err = xpc_pipe_routine_with_flags(pipe, xargs, &reply, 0);
-    xpc_release(pipe);
-    if (ownsXargs) xpc_release(xargs);
+    int err = AetherXpcPipeRoutineWithFlags(pipe, xargs, &reply, 0);
+    AetherXpcRelease(pipe);
+    if (ownsXargs) AetherXpcRelease(xargs);
 
     if (err != 0 || !reply) {
         return NULL;
@@ -109,7 +110,7 @@ const char *AetherDopamineGetJBRoot(void)
         if (rootPath && strlen(rootPath) > 0 && strlen(rootPath) < sizeof(gCachedJBRoot)) {
             strlcpy(gCachedJBRoot, rootPath, sizeof(gCachedJBRoot));
         }
-        xpc_release(reply);
+        AetherXpcRelease(reply);
     }
 
     return (gCachedJBRoot[0] != '\0') ? gCachedJBRoot : NULL;
@@ -137,7 +138,7 @@ int AetherDopamineTrustFileByPath(const char *path)
     int result = -3;
     if (reply) {
         result = (int)xpc_dictionary_get_int64(reply, "result");
-        xpc_release(reply);
+        AetherXpcRelease(reply);
     }
     close(fd);
     return result;
@@ -154,7 +155,7 @@ int AetherDopamineSetProcessDebugged(pid_t pid, bool fully)
     int result = -1;
     if (reply) {
         result = (int)xpc_dictionary_get_int64(reply, "result");
-        xpc_release(reply);
+        AetherXpcRelease(reply);
     }
     return result;
 }
