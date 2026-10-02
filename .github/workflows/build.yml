@@ -57,6 +57,7 @@ jobs:
           $CLANG $MMFLAGS -c UI/SettingsViewController.mm  -o build-mac/SettingsViewController.o 2>&1 || { echo "SettingsViewController.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS -c UI/AetherGoldButton.mm        -o build-mac/AetherGoldButton.o    2>&1 || { echo "AetherGoldButton.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS -c Core/AetherLog.mm             -o build-mac/AetherLog.o            2>&1 || { echo "AetherLog.mm FAIL"; exit 1; }
+          $CLANG $MMFLAGS -c UI/AetherGoldButton.mm        -o build-mac/AetherGoldButton.o    2>&1 || { echo "AetherGoldButton.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS -c UI/MainApp.mm                 -o build-mac/MainApp.o             2>&1 || { echo "MainApp.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS                -c HUD/FloatingToggleButton.mm -o build-mac/FloatingToggleButton.o 2>&1 || { echo "FloatingToggleButton.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS                -c HUD/HUDMainWindow.mm         -o build-mac/HUDMainWindow.o 2>&1 || { echo "HUDMainWindow.mm FAIL"; exit 1; }
@@ -72,14 +73,14 @@ jobs:
           if [ ! -f build-mac/AetherSharedMemory_dl.o ]; then
             $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm -o build-mac/AetherSharedMemory_dl.o 2>&1 || { echo "AetherSharedMemory_dl FAIL"; exit 1; }
           fi
-          $CLANG $TARGET $MINOS -isysroot $SDK_PATH -fuse-ld=lld \
+          $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -dynamiclib -Wl,-undefined,dynamic_lookup \
-            -framework Foundation -lobjc -lc++ \
+            -framework Foundation -framework CoreFoundation -lobjc -lc++ \
             build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherLog_dl.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o \
             -o build-mac/libNetHookPayload.dylib 2>&1 || { echo "DYLIB LINK FAIL"; exit 1; }
 
           # Link executable
-          $CLANG $TARGET $MINOS -isysroot $SDK_PATH -fuse-ld=lld \
+          $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
             -lobjc -lc++ \
