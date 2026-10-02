@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-macOS:
-    name: Build iOS Binary (macOS)
+    name: Build iOS IPA (macOS)
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -18,8 +18,10 @@ jobs:
       - name: Install dependencies
         run: |
           brew install ldid
+          pip3 install Pillow 2>/dev/null || true
 
       - name: Cross-build with clang
+        id: build
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
           if [ -z "$SDK_PATH" ]; then
@@ -72,9 +74,106 @@ jobs:
 
       - name: Fakesign with entitlements
         run: |
-          if command -v ldid >/dev/null 2>&1 && [ -f build-mac/AetherNet ]; then
-            ldid -Ssupports/entitlements.plist build-mac/AetherNet
-            ldid -Ssupports/entitlements.plist build-mac/libNetHookPayload.dylib
-            echo "Entitlements embedded"
-            ldid -e build-mac/AetherNet | head -5
+          # Generate Info.plist (Python plistlib)
+          python3 - <<'PYEOF'
+import plistlib, sys
+info = {
+    "CFBundleDevelopmentRegion": "en",
+    "CFBundleDisplayName": "AetherNet",
+    "CFBundleExecutable": "AetherNet",
+    "CFBundleIcons": {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["AppIcon60x60"]}},
+    "CFBundleIdentifier": "com.aethernet.interceptor",
+    "CFBundleInfoDictionaryVersion": "6.0",
+    "CFBundleName": "AetherNet",
+    "CFBundlePackageType": "APPL",
+    "CFBundleShortVersionString": "3.6.0",
+    "CFBundleVersion": "360",
+    "DTPlatformName": "iphoneos",
+    "DTPlatformVersion": "16.5",
+    "DTSDKName": "iphoneos16.5",
+    "LSRequiresIPhoneOS": True,
+    "MinimumOSVersion": "14.0",
+    "UIFileSharingEnabled": True,
+    "LSSupportsOpeningDocumentsInPlace": True,
+    "UIStatusBarStyle": "UIStatusBarStyleLightContent",
+    "UISupportedInterfaceOrientations": [
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+    ],
+    "UIViewControllerBasedStatusBarAppearance": False,
+}
+with open("build-mac/Info.plist", "wb") as f:
+    plistlib.dump(info, f)
+PYEOF
+
+          # Generate app icons from source PNG (120x120 and 180x180)
+          if command -v python3 >/dev/null 2>&1 && [ -f supports/AppIconSource.png ]; then
+            python3 - supports/AppIconSource.png build-mac/ <<'PYEOF'
+import sys
+try:
+    from PIL import Image
+    img = Image.open(sys.argv[1]).convert("RGBA")
+    for size, name in ((120, "AppIcon60x60@2x.png"), (180, "AppIcon60x60@3x.png")):
+        img.resize((size, size), Image.LANCZOS).save(f"{sys.argv[2]}/{name}")
+    print("Icons generated")
+except ImportError:
+    # Fallback: create solid color placeholder icons
+    from PIL import Image as PILImage
+    colors = [(0.906, 0.769, 0.478, 1.0), (0.40, 0.86, 0.62, 1.0)]
+    for size, name in ((120, "AppIcon60x60@2x.png"), (180, "AppIcon60x60@3x.png")):
+        img = PILImage.new("RGBA", (size, size), colors[0])
+        img.save(f"{sys.argv[2]}/{name}")
+    print("Placeholder icons generated (PIL resize unavailable)")
+PYEOF
+          else
+            # Create minimal placeholder icons
+            python3 -c "
+from PIL import Image
+img = Image.new('RGBA', (120, 120), (0.906, 0.769, 0.478, 1.0))
+img.save('build-mac/AppIcon60x60@2x.png')
+img2 = Image.new('RGBA', (180, 180), (0.906, 0.769, 0.478, 1.0))
+img2.save('build-mac/AppIcon60x60@3x.png')
+" 2>/dev/null || echo "Pillow not available, skipping icons"
           fi
+
+          # Stage the .app bundle
+          STAGE="build-mac/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/Payload/AetherNet.app"
+
+          # Copy binary + dylib into .app bundle
+          cp build-mac/AetherNet "$STAGE/Payload/AetherNet.app/AetherNet"
+          cp build-mac/libNetHookPayload.dylib "$STAGE/Payload/AetherNet.app/libNetHookPayload.dylib"
+          cp build-mac/Info.plist "$STAGE/Payload/AetherNet.app/Info.plist"
+          cp supports/AppIconSource.png "$STAGE/Payload/AetherNet.app/" 2>/dev/null || true
+          cp build-mac/AppIcon60x60@2x.png "$STAGE/Payload/AetherNet.app/" 2>/dev/null || true
+          cp build-mac/AppIcon60x60@3x.png "$STAGE/Payload/AetherNet.app/" 2>/dev/null || true
+
+          chmod 755 "$STAGE/Payload/AetherNet.app/AetherNet"
+          chmod 755 "$STAGE/Payload/AetherNet.app/libNetHookPayload.dylib"
+
+          # Fakesign both binary and dylib with TrollStore entitlements
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -Ssupports/entitlements.plist "$STAGE/Payload/AetherNet.app/AetherNet"
+            ldid -Ssupports/entitlements.plist "$STAGE/Payload/AetherNet.app/libNetHookPayload.dylib"
+            echo "Entitlements embedded"
+            ldid -e "$STAGE/Payload/AetherNet.app/AetherNet" | head -5
+          fi
+
+          # Package as .tipa (TrollStore IPA convention)
+          cd "$STAGE" && rm -f "$GITHUB_WORKSPACE/AetherNet.tipa" && zip -qry "$GITHUB_WORKSPACE/AetherNet.tipa" Payload
+          echo "tipa-package=true" >> $GITHUB_OUTPUT
+
+      - name: Show build artifacts
+        run: |
+          ls -la AetherNet.tipa 2>/dev/null || echo "No .tipa found"
+          unzip -l AetherNet.tipa 2>/dev/null | head -20
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        if: steps.build.outputs.tipa-package == 'true'
+        with:
+          name: AetherNet-tipa
+          path: AetherNet.tipa
+          retention-days: 14
