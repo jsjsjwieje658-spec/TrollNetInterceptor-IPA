@@ -64,12 +64,15 @@ jobs:
           echo "── Linking executable…"
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -Wl,-undefined,dynamic_lookup \
+            -ObjC -all_load \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework CoreFoundation \
             -lobjc -lc++ \
             build-mac/main.o build-mac/compiler_rt_shim_app.o \
             -o build-mac/AetherNet 2>&1 || { echo "EXECUTABLE LINK FAIL"; exit 1; }
 
           echo "── [3/4] Binary build succeeded"
+          echo "Verifying critical symbols…"
+          strings build-mac/AetherNet | grep "AetherFloatingToggleButton" | head -3 || echo "WARN: AetherFloatingToggleButton symbol not found!"
           file build-mac/AetherNet
           file build-mac/libNetHookPayload.dylib
 
