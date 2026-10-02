@@ -10,7 +10,7 @@
 //    xdict["jb-domain"] = uint64 domain
 //    xdict["action"]    = uint64 action
 //    …action args…
-//    → AetherXpcPipeRoutineWithFlags(pipe_to_launchd, xdict, &xreply, 0)
+//    → xpc_pipe_routine_with_flags(pipe_to_launchd, xdict, &xreply, 0)
 //    xreply["result"] = int64 (0 == success)
 //
 
@@ -21,15 +21,22 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "DopamineBridge.h"
-#include "AetherXpcPrivate.h"
 
 // ---------------------------------------------------------------------------
-// xpc types — forward-declare to avoid dependency on <xpc/xpc.h> which may
-// be missing from sparse SDKs (theos/iPhoneOS16.5). All xpc APIs resolve at
-// runtime from the always-loaded libxpc.dylib.
+// Private libxpc SPI (resolved via dynamic_lookup at runtime)
 // ---------------------------------------------------------------------------
-typedef objc_object *xpc_object_t_objc;  // opaque Obj-C type behind xpc_object_t
-typedef xpc_object_t_objc xpc_t;
+typedef void *xpc_t;
+
+extern "C" {
+extern xpc_t    xpc_dictionary_create_empty(void);
+extern void     xpc_dictionary_set_uint64(xpc_t, const char *, uint64_t);
+extern void     xpc_dictionary_set_bool(xpc_t, const char *, bool);
+extern int64_t  xpc_dictionary_get_int64(xpc_t, const char *);
+extern const char *xpc_dictionary_get_string(xpc_t, const char *);
+extern void     xpc_release(xpc_t);
+extern xpc_t    xpc_pipe_create_from_port(mach_port_t, uint64_t flags);
+extern int      xpc_pipe_routine_with_flags(xpc_t pipe, xpc_t message, xpc_t *reply, uint32_t flags);
+}
 
 // ---------------------------------------------------------------------------
 // Dopamine jbserver domains & actions (jbserver_domains.h, branch 3.x)
@@ -74,20 +81,20 @@ static xpc_t AetherJBServerSend(uint64_t domain, uint64_t action, xpc_t xargs)
 
     mach_port_t launchdPort = MACH_PORT_NULL;
     if (AetherGetLaunchdPort(&launchdPort) != KERN_SUCCESS) {
-        if (ownsXargs) AetherXpcRelease(xargs);
+        if (ownsXargs) xpc_release(xargs);
         return NULL;
     }
 
-    xpc_t pipe = AetherXpcPipeCreateFromPort(launchdPort, 0);
+    xpc_t pipe = xpc_pipe_create_from_port(launchdPort, 0);
     if (!pipe) {
-        if (ownsXargs) AetherXpcRelease(xargs);
+        if (ownsXargs) xpc_release(xargs);
         return NULL;
     }
 
     xpc_t reply = NULL;
-    int err = AetherXpcPipeRoutineWithFlags(pipe, xargs, &reply, 0);
-    AetherXpcRelease(pipe);
-    if (ownsXargs) AetherXpcRelease(xargs);
+    int err = xpc_pipe_routine_with_flags(pipe, xargs, &reply, 0);
+    xpc_release(pipe);
+    if (ownsXargs) xpc_release(xargs);
 
     if (err != 0 || !reply) {
         return NULL;
@@ -112,7 +119,7 @@ const char *AetherDopamineGetJBRoot(void)
         if (rootPath && strlen(rootPath) > 0 && strlen(rootPath) < sizeof(gCachedJBRoot)) {
             strlcpy(gCachedJBRoot, rootPath, sizeof(gCachedJBRoot));
         }
-        AetherXpcRelease(reply);
+        xpc_release(reply);
     }
 
     return (gCachedJBRoot[0] != '\0') ? gCachedJBRoot : NULL;
@@ -140,7 +147,7 @@ int AetherDopamineTrustFileByPath(const char *path)
     int result = -3;
     if (reply) {
         result = (int)xpc_dictionary_get_int64(reply, "result");
-        AetherXpcRelease(reply);
+        xpc_release(reply);
     }
     close(fd);
     return result;
@@ -157,7 +164,7 @@ int AetherDopamineSetProcessDebugged(pid_t pid, bool fully)
     int result = -1;
     if (reply) {
         result = (int)xpc_dictionary_get_int64(reply, "result");
-        AetherXpcRelease(reply);
+        xpc_release(reply);
     }
     return result;
 }
