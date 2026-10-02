@@ -53,12 +53,17 @@ jobs:
             -o build-mac/libNetHookPayload.dylib 2>&1 || { echo "DYLIB LINK FAIL"; exit 1; }
 
           echo "── [2/4] Compiling AetherNet executable (arm64)…"
+          # main.mm uses #import of other .mm/.m files (single-binary pattern).
+          # We compile main.mm as the sole translation unit. Note: -dead_strip is
+          # NOT used here because it would strip classes like AetherFloatingToggleButton
+          # that are only referenced indirectly via objc_getClass/NSInvocation in
+          # the HUD plugin-mode bootstrap path.
           $CLANG $MMFLAGS -c main.mm -o build-mac/main.o 2>&1 || { echo "main.mm FAIL"; exit 1; }
           $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
 
           echo "── Linking executable…"
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
-            -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+            -Wl,-undefined,dynamic_lookup \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework CoreFoundation \
             -lobjc -lc++ \
             build-mac/main.o build-mac/compiler_rt_shim_app.o \
