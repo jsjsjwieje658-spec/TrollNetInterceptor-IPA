@@ -39,7 +39,7 @@ DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherLog_dl.o")
 # Module: AetherNet executable (main dispatcher → app UI + HUD plugin mode)
 APP_OBJS=("$OUT/main.o" "$OUT/AetherSharedMemory.o" "$OUT/ProcessManager.o" \
           "$OUT/MachInjector.o" "$OUT/DopamineBridge.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
-          "$OUT/SettingsViewController.o" "$OUT/AetherGoldButton.o" "$OUT/AetherLog.o")
+          "$OUT/SettingsViewController.o" "$OUT/LogViewController.o" "$OUT/AetherGoldButton.o" "$OUT/AetherLog.o")
 
 mkdir -p "$OUT" "$APP"
 
@@ -68,6 +68,7 @@ APP_OBJS+=("$OUT/FloatingToggleButton.o" "$OUT/HUDMainWindow.o" \
 APP_OBJS+=("$OUT/compiler_rt_shim_app.o")
 $CC $MMFLAGS -c "$ROOT/UI/AppTheme.mm"                -o "$OUT/AppTheme.o"            || exit 1
 $CC $MMFLAGS -c "$ROOT/UI/HomeViewController.mm"      -o "$OUT/HomeViewController.o"  || exit 1
+$CC $MMFLAGS -c "$ROOT/UI/LogViewController.mm"      -o "$OUT/LogViewController.o"    || exit 1
 $CC $MMFLAGS -c "$ROOT/UI/SettingsViewController.mm"  -o "$OUT/SettingsViewController.o" || exit 1
 $CC $MMFLAGS -c "$ROOT/UI/AetherGoldButton.mm"        -o "$OUT/AetherGoldButton.o"     || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/AetherLog.mm"             -o "$OUT/AetherLog.o"            || exit 1

@@ -36,4 +36,7 @@ void AetherLogDaemonWithLevel(AetherLogLevel level, NSString *format, ...) NS_FO
 /// Synchronous variant — safe right before exit(0).
 void AetherLogDaemonSync(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 
+/// Clear app log file (for use by the Log tab's Clear button).
+void AetherLogClear(void);
+
 NS_ASSUME_NONNULL_END

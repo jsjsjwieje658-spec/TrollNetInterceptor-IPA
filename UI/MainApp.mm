@@ -14,6 +14,7 @@
 #import <time.h>
 #import "../headers/AetherNetShared.h"
 #import "HomeViewController.h"
+#import "LogViewController.h"
 #import "SettingsViewController.h"
 #import "AppTheme.h"
 #import "../Core/ProcessManager.h"
@@ -112,7 +113,13 @@
     settingsNav.navigationBar.tintColor = [AppTheme colorGold];
     settingsNav.navigationBar.prefersLargeTitles = YES;
 
-    self.viewControllers = @[homeNav, settingsNav];
+    LogViewController *logVC = [[LogViewController alloc] init];
+    UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+    logNav.navigationBar.barStyle = UIBarStyleBlack;
+    logNav.navigationBar.tintColor = [AppTheme colorGold];
+    logNav.navigationBar.prefersLargeTitles = YES;
+
+    self.viewControllers = @[homeNav, logNav, settingsNav];
     self.tabBar.barStyle = UIBarStyleBlack;
     self.tabBar.tintColor = [AppTheme colorGold];
     self.tabBar.unselectedItemTintColor = [AppTheme colorTextSecondary];
@@ -126,11 +133,16 @@
     homeItem.selectedImage = [self systemSymbol:@"bolt.horizontal.fill" fallback:@"⇄"];
     homeItem.image = [self systemSymbol:@"bolt.horizontal" fallback:@"⇄"];
 
+    UITabBarItem *logItem = [[UITabBarItem alloc] initWithTitle:@"Log" image:nil tag:2];
+    logItem.selectedImage = [self systemSymbol:@"text.alignleft.fill" fallback:@"📝"];
+    logItem.image = [self systemSymbol:@"text.alignleft" fallback:@"📝"];
+
     UITabBarItem *settingsItem = [[UITabBarItem alloc] initWithTitle:@"Settings" image:nil tag:1];
     settingsItem.image = [self systemSymbol:@"slider.horizontal.3" fallback:@"⚙"];
     settingsItem.selectedImage = [self systemSymbol:@"slider.horizontal.3.fill" fallback:@"⚙"];
 
     homeNav.tabBarItem = homeItem;
+    logNav.tabBarItem = logItem;
     settingsNav.tabBarItem = settingsItem;
 }
 

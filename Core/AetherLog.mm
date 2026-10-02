@@ -230,3 +230,17 @@ NSString * _Nullable AetherLogAppPath(void)
     ensureLogQueue();
     return gAppLogPath;
 }
+
+void AetherLogClear(void)
+{
+    ensureLogQueue();
+    if (gAppLogPath) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:gAppLogPath error:nil];
+        [fm createFileAtPath:gAppLogPath contents:nil attributes:nil];
+    }
+    // Also clear the daemon log so merged state resets
+    NSString *daemonPath = @"/var/mobile/Library/aethernet-hud.log";
+    [fm removeItemAtPath:daemonPath error:nil];
+    [fm createFileAtPath:daemonPath contents:nil attributes:nil];
+}
