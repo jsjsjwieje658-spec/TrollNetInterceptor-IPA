@@ -104,7 +104,28 @@ static bool AetherHookGatesPass(void) {
     return AetherOwnBundleMatchesTarget();
 }
 
-// Determines whether a packet should be intercepted based on Tab 2 (Settings) rules
+// Checks direction + protocol filters only (no capture-ratio probability).
+// Used for Delay/Jitter network simulation which should apply to ALL packets,
+// not just the fraction selected by captureRatioPercent.
+static bool AetherDirectionProtoMatch(bool isUpload, bool isTCP, bool isUDP) {
+    if (!gState) gState = AetherGetSharedState();
+    if (!gState) return false;
+
+    if (!aether_atomic_load(&gState->interceptionActive)) return false;
+    if (!AetherHookGatesPass()) return false;
+
+    uint8_t dir = aether_atomic_load(&gState->direction);
+    if (dir == AetherDirectionDownload && isUpload) return false;
+    if (dir == AetherDirectionUpload && !isUpload) return false;
+
+    uint8_t proto = aether_atomic_load(&gState->protocolFilter);
+    if (proto == AetherProtoUDPOnly && !isUDP) return false;
+    if (proto == AetherProtoTCPOnly && !isTCP) return false;
+
+    return true;
+}
+
+// Determines whether a packet should be intercepted (Hold/Drop) based on capture probability
 static bool ShouldInterceptPacket(bool isUpload, bool isTCP, bool isUDP, uint32_t *outEffectiveRatio) {
     if (!gState) gState = AetherGetSharedState();
     if (!gState) return false;
@@ -195,10 +216,17 @@ static ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags,
         if (isUDP) aether_atomic_fetch_add(&gState->totalUDPPacketsTX, 1);
         aether_atomic_fetch_add(&gState->totalBytesTX, len);
 
+        uint8_t mode = aether_atomic_load(&gState->interceptMode);
+
+        // Delay/Jitter network simulation applies to ALL matching packets
+        // (direction + protocol filters), NOT just the capture-ratio subset.
+        if (mode == AetherModeDelayJitter && AetherDirectionProtoMatch(true, isTCP, isUDP)) {
+            ApplyNetworkConditioningDelay(len);
+            AetherLogDaemon(@"[TX %s %zuB] delay+jitter applied", isTCP ? "TCP" : "UDP", len);
+        }
+
         uint32_t ratio = 0;
         if (ShouldInterceptPacket(true /* isUpload */, isTCP, isUDP, &ratio)) {
-            uint8_t mode = aether_atomic_load(&gState->interceptMode);
-
             if (mode == AetherModeHoldQueue) {
                 // Buffer outbound packet in memory queue while ⏸ is active
                 pthread_mutex_lock(&gQueueMutex);
@@ -222,8 +250,6 @@ static ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags,
             } else if (mode == AetherModeDropPacket) {
                 aether_atomic_fetch_add(&gState->droppedPacketsCount, 1);
                 return (ssize_t)len;
-            } else if (mode == AetherModeDelayJitter) {
-                ApplyNetworkConditioningDelay(len);
             }
         }
 
@@ -231,6 +257,23 @@ static ssize_t hooked_sendto(int sockfd, const void *buf, size_t len, int flags,
         uint32_t dupPct = aether_atomic_load(&gState->duplicatePacketPercent);
         if (dupPct > 0 && isUDP && arc4random_uniform(100) < dupPct) {
             orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+        }
+
+        // Real-time TX detail logging (when not holding/dropping - those short-circuit above)
+        if (mode != AetherModeHoldQueue && mode != AetherModeDropPacket) {
+            char addrStr[INET6_ADDRSTRLEN] = {0};
+            if (dest_addr && addrlen > 0 &&
+                (dest_addr->sa_family == AF_INET || dest_addr->sa_family == AF_INET6)) {
+                void *addrPtr = NULL;
+                if (dest_addr->sa_family == AF_INET) {
+                    addrPtr = &((struct sockaddr_in *)dest_addr)->sin_addr;
+                } else {
+                    addrPtr = &((struct sockaddr_in6 *)dest_addr)->sin6_addr;
+                }
+                inet_ntop(dest_addr->sa_family, addrPtr, addrStr, sizeof(addrStr));
+            }
+            AetherLogDaemon(@"[TX %s %zuB -> %s] fd=%d",
+                            isTCP ? "TCP" : "UDP", len, addrStr[0] ? addrStr : "?", sockfd);
         }
     }
 
@@ -254,15 +297,25 @@ static ssize_t hooked_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
         if (isUDP) aether_atomic_fetch_add(&gState->totalUDPPacketsTX, 1);
         aether_atomic_fetch_add(&gState->totalBytesTX, totalBytes);
 
+        uint8_t mode = aether_atomic_load(&gState->interceptMode);
+
+        // Delay/Jitter network simulation applies to ALL matching packets
+        if (mode == AetherModeDelayJitter && AetherDirectionProtoMatch(true, isTCP, isUDP)) {
+            ApplyNetworkConditioningDelay(totalBytes);
+            AetherLogDaemon(@"[TX %s %zuB] delay+jitter applied", isTCP ? "TCP" : "UDP", totalBytes);
+        }
+
         uint32_t ratio = 0;
         if (ShouldInterceptPacket(true, isTCP, isUDP, &ratio)) {
-            uint8_t mode = aether_atomic_load(&gState->interceptMode);
             if (mode == AetherModeHoldQueue || mode == AetherModeDropPacket) {
                 aether_atomic_fetch_add(&gState->droppedPacketsCount, 1);
                 return (ssize_t)totalBytes;
-            } else if (mode == AetherModeDelayJitter) {
-                ApplyNetworkConditioningDelay(totalBytes);
             }
+        }
+
+        // Real-time TX detail logging (when not holding/dropping)
+        if (mode != AetherModeHoldQueue && mode != AetherModeDropPacket) {
+            AetherLogDaemon(@"[TX %s %zuB] sendmsg fd=%d", isTCP ? "TCP" : "UDP", totalBytes, sockfd);
         }
     }
     return orig_sendmsg(sockfd, msg, flags);
@@ -277,10 +330,15 @@ static ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags,
     bool isTrackedSocket = InspectSocketProtocol(sockfd, &isTCP, &isUDP);
 
     if (isTrackedSocket && gState) {
+        uint8_t mode = aether_atomic_load(&gState->interceptMode);
+
+        // Delay/Jitter network simulation applies to ALL matching packets
+        if (mode == AetherModeDelayJitter && AetherDirectionProtoMatch(false, isTCP, isUDP)) {
+            ApplyNetworkConditioningDelay(len);
+        }
+
         uint32_t ratio = 0;
         if (ShouldInterceptPacket(false /* isUpload = false (Download) */, isTCP, isUDP, &ratio)) {
-            uint8_t mode = aether_atomic_load(&gState->interceptMode);
-
             if (mode == AetherModeHoldQueue) {
                 // For non-blocking game/app sockets, return EWOULDBLOCK so inbound packets
                 // stay queued inside the XNU kernel socket receive buffer (soi_rcv) until unpaused!
@@ -295,8 +353,6 @@ static ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags,
                 }
                 errno = EWOULDBLOCK;
                 return -1;
-            } else if (mode == AetherModeDelayJitter) {
-                ApplyNetworkConditioningDelay(len);
             }
         }
     }
@@ -306,6 +362,8 @@ static ssize_t hooked_recvfrom(int sockfd, void *buf, size_t len, int flags,
         if (isTCP) aether_atomic_fetch_add(&gState->totalTCPPacketsRX, 1);
         if (isUDP) aether_atomic_fetch_add(&gState->totalUDPPacketsRX, 1);
         aether_atomic_fetch_add(&gState->totalBytesRX, (uint64_t)bytesRead);
+        // Real-time packet detail logging
+        AetherLogDaemon(@"[RX %s %zdB] bytes rx", isTCP ? "TCP" : "UDP", bytesRead);
     }
     return bytesRead;
 }
@@ -319,9 +377,21 @@ static ssize_t hooked_recvmsg(int sockfd, struct msghdr *msg, int flags) {
     bool isTrackedSocket = InspectSocketProtocol(sockfd, &isTCP, &isUDP);
 
     if (isTrackedSocket && gState) {
+        uint8_t mode = aether_atomic_load(&gState->interceptMode);
+
+        // Delay/Jitter network simulation applies to ALL matching packets
+        if (mode == AetherModeDelayJitter && AetherDirectionProtoMatch(false, isTCP, isUDP)) {
+            size_t len = 0;
+            if (msg) {
+                for (int i = 0; i < msg->msg_iovlen; i++) {
+                    len += msg->msg_iov[i].iov_len;
+                }
+            }
+            ApplyNetworkConditioningDelay(len);
+        }
+
         uint32_t ratio = 0;
         if (ShouldInterceptPacket(false, isTCP, isUDP, &ratio)) {
-            uint8_t mode = aether_atomic_load(&gState->interceptMode);
             if (mode == AetherModeHoldQueue) {
                 aether_atomic_fetch_add(&gState->heldPacketsCount, 1);
                 errno = EWOULDBLOCK;
@@ -340,6 +410,7 @@ static ssize_t hooked_recvmsg(int sockfd, struct msghdr *msg, int flags) {
         if (isTCP) aether_atomic_fetch_add(&gState->totalTCPPacketsRX, 1);
         if (isUDP) aether_atomic_fetch_add(&gState->totalUDPPacketsRX, 1);
         aether_atomic_fetch_add(&gState->totalBytesRX, (uint64_t)bytesRead);
+        AetherLogDaemon(@"[RX %s %zd B] recvmsg", isTCP ? "TCP" : "UDP", bytesRead);
     }
     return bytesRead;
 }
@@ -383,9 +454,25 @@ static void AetherPayloadInitializer(void) {
         BOOL nowArmed = aether_atomic_load(&st->interceptionActive) && AetherHookGatesPass();
         if (nowArmed != lastArmed) {
             lastArmed = nowArmed;
-            AetherLogDaemon(@"[pid %d] capture %s (bundle=%s)",
+            AetherLogDaemon(@"[pid %d] capture %s (mode=%u dir=%u proto=%u) (bundle=%s)",
                             getpid(), nowArmed ? "START" : "STOP",
+                            aether_atomic_load(&st->interceptMode),
+                            aether_atomic_load(&st->direction),
+                            aether_atomic_load(&st->protocolFilter),
                             gOwnBundleID.UTF8String ?: "?");
+        }
+    });
+
+    // Log configuration changes for real-time visibility in the log viewer
+    int configLogToken = 0;
+    notify_register_dispatch(kAetherNotifyConfigChanged, &configLogToken, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int token) {
+        if (gState && AetherHookGatesPass()) {
+            AetherLogDaemon(@"[pid %d] config changed: mode=%u latency=%ums jitter=%ums bw=%ukbps",
+                            getpid(),
+                            aether_atomic_load(&gState->interceptMode),
+                            aether_atomic_load(&gState->simulatedLatencyMs),
+                            aether_atomic_load(&gState->simulatedJitterMs),
+                            aether_atomic_load(&gState->bandwidthLimitKbps));
         }
     });
 }

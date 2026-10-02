@@ -37,6 +37,7 @@
 @implementation AetherEngineCoordinator {
     uint64_t _lastRXBytes;
     uint64_t _lastTXBytes;
+    NSTimeInterval _lastFlushTime;
 }
 
 + (instancetype)shared {
@@ -58,6 +59,8 @@
     AetherSharedState *state = AetherGetSharedState();
     if (!state) return;
 
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+
     // --- 1. Live rate computation (bytes delta per second) ---
     uint64_t rx = aether_atomic_load(&state->totalBytesRX);
     uint64_t tx = aether_atomic_load(&state->totalBytesTX);
@@ -72,15 +75,13 @@
         [[AetherProcessManager sharedManager] refreshSocketTelemetryForPID:pid];
     }
 
-    // --- 3. Safety auto-flush of held packets ---
-    if (aether_atomic_load(&state->interceptionActive) && aether_atomic_load(&state->heldPacketsCount) > 0) {
+    // --- 3. Safety auto-flush of held packets (time-based, not count-modulo) ---
+    if (aether_atomic_load(&state->interceptionActive)) {
         uint32_t flushAfter = aether_atomic_load(&state->autoFlushSeconds);
-        if (flushAfter > 0 && (aether_atomic_load(&state->heldPacketsCount) % (uint64_t)flushAfter) == 0) {
-            // Stochastic release keeps the game session alive instead of hard timeout
-            static uint32_t lastFlushTick = 0;
-            uint32_t now = (uint32_t)time(NULL);
-            if (now - lastFlushTick >= flushAfter) {
-                lastFlushTick = now;
+        uint64_t held = aether_atomic_load(&state->heldPacketsCount);
+        if (flushAfter > 0 && held > 0) {
+            if (now - _lastFlushTime >= (NSTimeInterval)flushAfter) {
+                _lastFlushTime = now;
                 notify_post(kAetherNotifyFlushQueue);
             }
         }

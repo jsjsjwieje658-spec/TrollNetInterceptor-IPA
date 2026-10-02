@@ -692,6 +692,8 @@ static void AetherDisableAutoresizingTranslates(UIView *view)
     tv.textColor = [AppTheme colorTextPrimary];
     tv.font = [AppTheme monoFont:10.0];
     tv.text = content;
+    // Auto-scroll to bottom so latest entries are visible
+    [tv scrollRangeToVisible:NSMakeRange(content.length, 0)];
     [vc.view addSubview:tv];
     [NSLayoutConstraint activateConstraints:@[
         [tv.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:8],
@@ -709,7 +711,34 @@ static void AetherDisableAutoresizingTranslates(UIView *view)
     nav.navigationBar.barTintColor = [AppTheme colorObsidian];
     nav.navigationBar.translucent = NO;
     nav.navigationBar.titleTextAttributes = @{NSForegroundColorAttributeName: [AppTheme colorTextPrimary]};
-    [self presentViewController:nav animated:YES completion:nil];
+
+    // Auto-refresh log content every 1.5s while the viewer is visible.
+    // Merges daemon log so injected-payload logs surface in real time,
+    // then auto-scrolls to the bottom.
+    __weak UITextView *weakTV = tv;
+    NSTimer *refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.5
+                                                             repeats:YES
+                                                               block:^(NSTimer *timer) {
+        AetherLogMergeDaemonLog();
+        NSString *p = AetherLogAppPath();
+        NSString *c = p ? [NSString stringWithContentsOfFile:p
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:nil] : nil;
+        if (c.length > 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong UITextView *strongTV = weakTV;
+                if (strongTV) {
+                    strongTV.text = c;
+                    [strongTV scrollRangeToVisible:NSMakeRange(c.length, 0)];
+                }
+            });
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:refreshTimer forMode:NSRunLoopCommonModes];
+
+    [self presentViewController:nav animated:YES completion:^{
+        [refreshTimer invalidate];
+    }];
 }
 
 - (void)shareLogTapped {
@@ -824,8 +853,8 @@ static NSString * FormatRate(uint32_t bytesPerSec) {
 
     self.tcpStatLabel.text = [NSString stringWithFormat:@"%u sockets · ↓%llu ↑%llu pkts", tcp, tcpRX, tcpTX];
     self.udpStatLabel.text = [NSString stringWithFormat:@"%u sockets · ↓%llu ↑%llu pkts", udp, udpRX, udpTX];
-    self.tcpRateLabel.text = [NSString stringWithFormat:@"↓ %@ · ↑ %@", FormatRate(rxRate / 2), FormatRate(rxRate / 2)];
-    self.udpRateLabel.text = [NSString stringWithFormat:@"↓ %@ · ↑ %@", FormatRate(txRate / 2), FormatRate(txRate / 2)];
+    self.tcpRateLabel.text = [NSString stringWithFormat:@"↓ %@ · ↑ %@", FormatRate(rxRate), FormatRate(txRate)];
+    self.udpRateLabel.text = [NSString stringWithFormat:@"↓ %@ · ↑ %@", FormatRate(rxRate), FormatRate(txRate)];
 
     uint8_t dir = aether_atomic_load(&state->direction);
     uint8_t mode = aether_atomic_load(&state->interceptMode);

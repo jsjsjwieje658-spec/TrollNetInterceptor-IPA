@@ -448,23 +448,36 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     if (active && !aether_atomic_load(&state->isInjected)) {
         pid_t targetPID = aether_atomic_load(&state->targetPID);
         if (targetPID > 0) {
+            // Stage the dylib: copy to accessible path
             NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
             NSString *signedCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
-            NSString *use = bundled ?: nil;
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if ([fm fileExistsAtPath:signedCopy]) use = signedCopy; // coretrust-signed beats adhoc
+            NSString *use = signedCopy; // prefer coretrust-signed if available
+            if (!use || ![use length]) use = bundled;
             if (use) {
-                [fm removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                [fm copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                [[NSFileManager defaultManager] removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                [[NSFileManager defaultManager] copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
                 chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
             }
+
+            // Tier 0: Dopamine PPL bypass (trust file + cs_allow_invalid) — REQUIRED on PPL devices
+            BOOL dopamineAssisted = NO;
+            if (AetherDopamineAvailable()) {
+                dopamineAssisted = AetherDopaminePrepareInjection(targetPID, AETHER_DYLIB_INSTALL_PATH);
+            }
+
+            // Tier 1: Mach remote dlopen injection
             char errBuf2[256] = {0};
             int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
-            AetherLog(@"LIVE attach pid %d rc=%d src=%@ err=[%s]",
-                      targetPID, rc2, use.lastPathComponent ?: @"(none)", errBuf2);
+            AetherLog(@"LIVE attach pid %d rc=%d dopamine=%d err=[%s]",
+                      targetPID, rc2, dopamineAssisted, errBuf2);
             if (rc2 == 0) {
                 aether_atomic_store(&state->isInjected, true);
-                aether_atomic_store(&state->injectionMethod, 1);
+                aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1);
+            } else {
+                // Tier 2: Root PF/Socket engine fallback
+                AetherApplyRootTrafficControl(targetPID, state);
+                aether_atomic_store(&state->isInjected, true);
+                aether_atomic_store(&state->injectionMethod, 2);
             }
         }
     }
@@ -472,6 +485,9 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     if (wasActive && !active) {
         // Flushing held TCP/UDP packet queue when switching from ⏸ (Pause/Hold) -> ▶ (Play/Release)
         notify_post(kAetherNotifyFlushQueue);
+    } else if (!wasActive && active) {
+        // Notify the injected payload that settings may have changed
+        notify_post(kAetherNotifyConfigChanged);
     }
 
     pid_t targetPID = aether_atomic_load(&state->targetPID);
