@@ -18,80 +18,52 @@ jobs:
       - name: Install dependencies
         run: |
           brew install ldid
-          brew install xcodegen || true
 
       - name: Cross-build with clang
         run: |
-          # Attempt to use the crossbuild script logic adapted for macOS runner
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
           if [ -z "$SDK_PATH" ]; then
             echo "iPhoneOS SDK not available — cannot cross-build"
             exit 1
           fi
           echo "Using SDK: $SDK_PATH"
-          CC=arm64-apple-ios14.0-clang
-          # Use xcrun clang
           CLANG=$(xcrun --find clang 2>/dev/null || which clang)
           echo "Clang: $CLANG"
           TARGET="-target arm64-apple-ios14.0"
           MINOS="-mios-version-min=14.0"
-          COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK_PATH -I./headers -O2 -g0 -fmessage-length=0 -pipe -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Werror=format -Wno-unused-function -Wno-objc-designated-initializers -Wno-nullability-completeness"
+          COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK_PATH -I./headers -O2 -g0 -fmessage-length=0 -pipe -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Werror=format -Wno-unused-function -Wno-objc-designated-initializers -Wno-nullability-completeness -Wno-incomplete-umbrella"
           MMFLAGS="$COMMON_FLAGS -x objective-c++ -std=gnu++17 -fobjc-arc -fobjc-weak"
           CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
           mkdir -p build-mac
 
-          # Compile dylib objects
+          # Compile dylib objects (standalone — not imported by main.mm)
           $CLANG $MMFLAGS -c Payload/NetHookPayload.mm -o build-mac/NetHookPayload.o 2>&1 || { echo "NetHookPayload.mm FAIL"; exit 1; }
           $CLANG $CFLAGS   -c Payload/fishhook.c       -o build-mac/fishhook.o       2>&1 || { echo "fishhook.c FAIL"; exit 1; }
           $CLANG $MMFLAGS -DAETHER_LOG_STANDALONE -c Core/AetherLog.mm -o build-mac/AetherLog_dl.o 2>&1 || { echo "AetherLog.mm(dl) FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_dl.o 2>&1 || { echo "compiler_rt_shim.c FAIL"; exit 1; }
-
-          # Compile app objects
-          $CLANG $MMFLAGS -c main.mm                       -o build-mac/main.o                2>&1 || { echo "main.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm    -o build-mac/AetherSharedMemory.o  2>&1 || { echo "AetherSharedMemory.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/ProcessManager.mm        -o build-mac/ProcessManager.o      2>&1 || { echo "ProcessManager.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/MachInjector.mm          -o build-mac/MachInjector.o        2>&1 || { echo "MachInjector.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/DopamineBridge.mm        -o build-mac/DopamineBridge.o      2>&1 || { echo "DopamineBridge.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/AppTheme.mm                -o build-mac/AppTheme.o            2>&1 || { echo "AppTheme.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/HomeViewController.mm      -o build-mac/HomeViewController.o  2>&1 || { echo "HomeViewController.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/SettingsViewController.mm  -o build-mac/SettingsViewController.o 2>&1 || { echo "SettingsViewController.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/AetherGoldButton.mm        -o build-mac/AetherGoldButton.o    2>&1 || { echo "AetherGoldButton.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/AetherLog.mm             -o build-mac/AetherLog.o            2>&1 || { echo "AetherLog.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/AetherGoldButton.mm        -o build-mac/AetherGoldButton.o    2>&1 || { echo "AetherGoldButton.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c UI/MainApp.mm                 -o build-mac/MainApp.o             2>&1 || { echo "MainApp.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/FloatingToggleButton.mm -o build-mac/FloatingToggleButton.o 2>&1 || { echo "FloatingToggleButton.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/HUDMainWindow.mm         -o build-mac/HUDMainWindow.o 2>&1 || { echo "HUDMainWindow.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/HUDMain.mm               -o build-mac/HUDMain.o 2>&1 || { echo "HUDMain.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/HUDRootApplication.mm    -o build-mac/HUDRootApplication.o 2>&1 || { echo "HUDRootApplication.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/TSEventFetcher.mm        -o build-mac/TSEventFetcher.o 2>&1 || { echo "TSEventFetcher.mm FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/UITouchKIFAdditions.m    -o build-mac/UITouchKIFAdditions.o 2>&1 || { echo "UITouchKIFAdditions.m FAIL"; exit 1; }
-          $CLANG $MMFLAGS                -c HUD/IOHIDEventKIF.m          -o build-mac/IOHIDEventKIF.o 2>&1 || { echo "IOHIDEventKIF.m FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
+          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_dl.o 2>&1 || { echo "compiler_rt_shim.c(dl) FAIL"; exit 1; }
+          $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm -o build-mac/AetherSharedMemory_dl.o 2>&1 || { echo "AetherSharedMemory(dl) FAIL"; exit 1; }
 
           # Link dylib
-          DYLIB_OBJS="build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherLog_dl.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o"
-          if [ ! -f build-mac/AetherSharedMemory_dl.o ]; then
-            $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm -o build-mac/AetherSharedMemory_dl.o 2>&1 || { echo "AetherSharedMemory_dl FAIL"; exit 1; }
-          fi
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -dynamiclib -Wl,-undefined,dynamic_lookup \
             -framework Foundation -framework CoreFoundation -lobjc -lc++ \
             build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherLog_dl.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o \
             -o build-mac/libNetHookPayload.dylib 2>&1 || { echo "DYLIB LINK FAIL"; exit 1; }
 
+          # Compile executable — main.mm imports HUD/HUDMain.mm and UI/MainApp.mm
+          # directly (single-binary pattern), so we only compile main.mm to avoid
+          # duplicate symbols from the included .mm/.m files.
+          $CLANG $MMFLAGS -c main.mm -o build-mac/AetherNet.o 2>&1 || { echo "main.mm FAIL"; exit 1; }
+
+          # compiler_rt_shim (for app executable)
+          $CLANG $CFLAGS -c Core/compiler_rt_shim.c -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
+
           # Link executable
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
             -lobjc -lc++ \
-            build-mac/main.o build-mac/AetherSharedMemory.o build-mac/ProcessManager.o \
-            build-mac/MachInjector.o build-mac/DopamineBridge.o build-mac/AppTheme.o \
-            build-mac/HomeViewController.o build-mac/SettingsViewController.o \
-            build-mac/AetherGoldButton.o build-mac/AetherLog.o \
-            build-mac/FloatingToggleButton.o build-mac/HUDMainWindow.o build-mac/HUDMain.o \
-            build-mac/HUDRootApplication.o build-mac/TSEventFetcher.o \
-            build-mac/UITouchKIFAdditions.o build-mac/IOHIDEventKIF.o \
-            build-mac/compiler_rt_shim_app.o build-mac/MainApp.o \
+            build-mac/AetherNet.o build-mac/compiler_rt_shim_app.o \
             -o build-mac/AetherNet 2>&1 || { echo "EXECUTABLE LINK FAIL"; exit 1; }
 
           echo "Binary build succeeded"
