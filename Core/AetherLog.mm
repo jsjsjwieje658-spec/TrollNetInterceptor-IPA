@@ -234,8 +234,8 @@ NSString * _Nullable AetherLogAppPath(void)
 void AetherLogClear(void)
 {
     ensureLogQueue();
+    NSFileManager *fm = [NSFileManager defaultManager];
     if (gAppLogPath) {
-        NSFileManager *fm = [NSFileManager defaultManager];
         [fm removeItemAtPath:gAppLogPath error:nil];
         [fm createFileAtPath:gAppLogPath contents:nil attributes:nil];
     }
