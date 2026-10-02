@@ -448,14 +448,14 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     if (active && !aether_atomic_load(&state->isInjected)) {
         pid_t targetPID = aether_atomic_load(&state->targetPID);
         if (targetPID > 0) {
-            // Stage the dylib: copy to accessible path
+            // Stage the dylib: copy to accessible world-readable path
             NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
             NSString *signedCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
-            NSString *use = signedCopy; // prefer coretrust-signed if available
-            if (!use || ![use length]) use = bundled;
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *use = ([fm fileExistsAtPath:signedCopy]) ? signedCopy : bundled;
             if (use) {
-                [[NSFileManager defaultManager] removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                [[NSFileManager defaultManager] copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                [fm removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                [fm copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
                 chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
             }
 

@@ -23,6 +23,9 @@ static NSString *gDaemonLogPath = nil;
 // Log level names for formatted output
 static const char *kLogLevelNames[] = { "DEBUG", "INFO", "WARN", "ERROR" };
 
+// Forward declaration — ensureLogQueue is used before its definition
+static void ensureLogQueue(void);
+
 static NSString *AetherLogComputeAppPath(void)
 {
     NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
