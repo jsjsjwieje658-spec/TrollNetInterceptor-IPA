@@ -39,21 +39,28 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-19 main" \
             | sudo tee /etc/apt/sources.list.d/llvm19.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-19 lld-19
-          # clang invokes these unversioned names when linking Mach-O targets
+          sudo apt-get install -y -qq clang-19 lld-19 git-lfs
+          # Create unversioned wrappers for clang
           sudo ln -sf /usr/bin/clang-19    /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-19  /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/ld64.lld-19 /usr/local/bin/ld64.lld
+          # ld64.lld-19 is the Mach-O linker from LLVM LLD
+          if [ -f /usr/bin/ld64.lld-19 ]; then
+            sudo ln -sf /usr/bin/ld64.lld-19 /usr/local/bin/ld64.lld
+          fi
           clang --version | head -1
-          ld64.lld -v 2>&1 | head -1 || true
+          echo "ld64.lld-19 location: $(which ld64.lld-19 2>/dev/null || echo 'not found')"
 
       - name: Provision iPhoneOS16.5.sdk (theos/sdks sparse clone)
         run: |
           mkdir -p .deps
-          git clone --depth=1 --filter=blob:none --sparse \
-            https://github.com/theos/sdks.git .deps/sdk-repo
-          cd .deps/sdk-repo
+          cd .deps
+          git clone --filter=blob:none --sparse https://github.com/theos/sdks.git sdk-repo
+          cd sdk-repo
+          git lfs install
+          git lfs pull --include="iPhoneOS16.5.sdk/*"
           git sparse-checkout set iPhoneOS16.5.sdk
+          # Ensure all files are materialized
+          git lfs pull --include="iPhoneOS16.5.sdk/**" 2>/dev/null || true
           test -f iPhoneOS16.5.sdk/usr/include/unistd.h || {
             echo "::error::iPhoneOS16.5.sdk incomplete after sparse checkout"; exit 1; }
           echo "SDK ready: $(du -sh iPhoneOS16.5.sdk | cut -f1)"

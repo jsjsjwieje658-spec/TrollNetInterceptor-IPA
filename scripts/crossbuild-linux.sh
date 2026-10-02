@@ -23,23 +23,26 @@ OUT="$ROOT/build-linux"
 STAGE="$OUT/stage"
 APP="$STAGE/Payload/AetherNet.app"
 
-# Detect available linker
+# Detect available Mach-O linker (ld64.lld from LLVM LLD)
 LNK=""
-if command -v ld64.lld >/dev/null 2>&1; then
-    LNK="-fuse-ld=ld64.lld"
-elif clang++ --version 2>/dev/null | grep -q "lld"; then
-    LNK="-fuse-ld=lld"
-else
-    # Try to find ld64.lld in common locations
-    for p in /usr/bin/ld64.lld /usr/local/bin/ld64.lld /opt/llvm/bin/ld64.lld; do
+for linker in ld64.lld-19 ld64.lld; do
+    if command -v "$linker" >/dev/null 2>&1; then
+        LNK="-fuse-ld=$linker"
+        echo "Using Mach-O linker: $linker"
+        break
+    fi
+done
+if [ -z "$LNK" ]; then
+    for p in /usr/bin/ld64.lld* /usr/local/bin/ld64.lld*; do
         if [ -x "$p" ]; then
-            LNK="-fuse-ld=ld64.lld"
+            LNK="-fuse-ld=$(basename "$p")"
+            echo "Using Mach-O linker: $p"
             break
         fi
     done
 fi
 if [ -z "$LNK" ]; then
-    echo "WARNING: ld64.lld not found — falling back to default linker"
+    echo "WARNING: ld64.lld not found — using default linker"
     LNK=""
 fi
 echo "Linker flags: $LNK"
