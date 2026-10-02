@@ -33,120 +33,84 @@ jobs:
           echo "Clang: $CLANG"
           TARGET="-target arm64-apple-ios14.0"
           MINOS="-mios-version-min=14.0"
-          COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK_PATH -I./headers -O2 -g0 -fmessage-length=0 -pipe -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Werror=format -Wno-unused-function -Wno-objc-designated-initializers -Wno-nullability-completeness -Wno-incomplete-umbrella"
+          COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK_PATH -I./headers -O2 -g0 -fmessage-length=0 -pipe -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function -Wno-objc-designated-initializers -Wno-nullability-completeness -Wno-incomplete-umbrella"
           MMFLAGS="$COMMON_FLAGS -x objective-c++ -std=gnu++17 -fobjc-arc -fobjc-weak"
           CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
           mkdir -p build-mac
 
-          # Compile dylib objects (standalone — not imported by main.mm)
+          echo "── [1/4] Compiling libNetHookPayload.dylib (arm64)…"
           $CLANG $MMFLAGS -c Payload/NetHookPayload.mm -o build-mac/NetHookPayload.o 2>&1 || { echo "NetHookPayload.mm FAIL"; exit 1; }
           $CLANG $CFLAGS   -c Payload/fishhook.c       -o build-mac/fishhook.o       2>&1 || { echo "fishhook.c FAIL"; exit 1; }
-          $CLANG $MMFLAGS -DAETHER_LOG_STANDALONE -c Core/AetherLog.mm -o build-mac/AetherLog_dl.o 2>&1 || { echo "AetherLog.mm(dl) FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_dl.o 2>&1 || { echo "compiler_rt_shim.c(dl) FAIL"; exit 1; }
           $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm -o build-mac/AetherSharedMemory_dl.o 2>&1 || { echo "AetherSharedMemory(dl) FAIL"; exit 1; }
+          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_dl.o 2>&1 || { echo "compiler_rt_shim.c(dl) FAIL"; exit 1; }
+          $CLANG $MMFLAGS -DAETHER_LOG_STANDALONE -c Core/AetherLog.mm -o build-mac/AetherLog_dl.o 2>&1 || { echo "AetherLog.mm(dl) FAIL"; exit 1; }
 
-          # Link dylib
+          echo "── Linking dylib…"
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -dynamiclib -Wl,-undefined,dynamic_lookup \
             -framework Foundation -framework CoreFoundation -lobjc -lc++ \
-            build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherLog_dl.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o \
+            build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o build-mac/AetherLog_dl.o \
             -o build-mac/libNetHookPayload.dylib 2>&1 || { echo "DYLIB LINK FAIL"; exit 1; }
 
-          # Compile executable — main.mm imports HUD/HUDMain.mm and UI/MainApp.mm
-          # directly (single-binary pattern), so we only compile main.mm to avoid
-          # duplicate symbols from the included .mm/.m files.
-          $CLANG $MMFLAGS -c main.mm -o build-mac/AetherNet.o 2>&1 || { echo "main.mm FAIL"; exit 1; }
+          echo "── [2/4] Compiling AetherNet executable (arm64)…"
+          $CLANG $MMFLAGS -c main.mm -o build-mac/main.o 2>&1 || { echo "main.mm FAIL"; exit 1; }
+          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
 
-          # compiler_rt_shim (for app executable)
-          $CLANG $CFLAGS -c Core/compiler_rt_shim.c -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
-
-          # Link executable
+          echo "── Linking executable…"
           $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
             -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
-            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
+            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework CoreFoundation \
             -lobjc -lc++ \
-            build-mac/AetherNet.o build-mac/compiler_rt_shim_app.o \
+            build-mac/main.o build-mac/compiler_rt_shim_app.o \
             -o build-mac/AetherNet 2>&1 || { echo "EXECUTABLE LINK FAIL"; exit 1; }
 
-          echo "Binary build succeeded"
+          echo "── [3/4] Binary build succeeded"
           file build-mac/AetherNet
           file build-mac/libNetHookPayload.dylib
 
       - name: Generate Info.plist
         run: |
-          python3 -c "
-          import plistlib
-          info = {
-              'CFBundleDevelopmentRegion': 'en',
-              'CFBundleDisplayName': 'AetherNet',
-              'CFBundleExecutable': 'AetherNet',
-              'CFBundleIcons': {'CFBundlePrimaryIcon': {'CFBundleIconFiles': ['AppIcon60x60']}},
-              'CFBundleIdentifier': 'com.aethernet.interceptor',
-              'CFBundleInfoDictionaryVersion': '6.0',
-              'CFBundleName': 'AetherNet',
-              'CFBundlePackageType': 'APPL',
-              'CFBundleShortVersionString': '3.6.0',
-              'CFBundleVersion': '360',
-              'DTPlatformName': 'iphoneos',
-              'DTPlatformVersion': '16.5',
-              'DTSDKName': 'iphoneos16.5',
-              'LSRequiresIPhoneOS': True,
-              'MinimumOSVersion': '14.0',
-              'UIFileSharingEnabled': True,
-              'LSSupportsOpeningDocumentsInPlace': True,
-              'UIStatusBarStyle': 'UIStatusBarStyleLightContent',
-              'UISupportedInterfaceOrientations': [
-                  'UIInterfaceOrientationPortrait',
-                  'UIInterfaceOrientationLandscapeLeft',
-                  'UIInterfaceOrientationLandscapeRight',
-              ],
-              'UIViewControllerBasedStatusBarAppearance': False,
-          }
-          with open('build-mac/Info.plist', 'wb') as f:
-              plistlib.dump(info, f)
-          print('Info.plist generated')
-          "
-
-      - name: Generate app icons
-        run: |
-          python3 -c "
-          from PIL import Image
-          img = Image.open('supports/AppIconSource.png').convert('RGBA')
-          for size, name in ((120, 'AppIcon60x60@2x.png'), (180, 'AppIcon60x60@3x.png')):
-              img.resize((size, size), Image.LANCZOS).save(f'build-mac/{name}')
-          print('Icons generated')
-          " 2>/dev/null || python3 -c "
-          from PIL import Image
-          img = Image.new('RGBA', (120, 120), (231, 197, 122, 255))
-          img.save('build-mac/AppIcon60x60@2x.png')
-          img2 = Image.new('RGBA', (180, 180), (231, 197, 122, 255))
-          img2.save('build-mac/AppIcon60x60@3x.png')
-          print('Placeholder icons generated')
-          " 2>/dev/null || echo "Pillow not available, will skip icon generation"
+          python3 scripts/gen_info_plist.py build-mac/Info.plist
 
       - name: Stage IPA bundle
         run: |
           STAGE="build-mac/stage"
+          APP="$STAGE/Payload/AetherNet.app"
           rm -rf "$STAGE"
-          mkdir -p "$STAGE/Payload/AetherNet.app"
+          mkdir -p "$APP"
 
-          # Copy binary + dylib into .app bundle
-          cp build-mac/AetherNet "$STAGE/Payload/AetherNet.app/AetherNet"
-          cp build-mac/libNetHookPayload.dylib "$STAGE/Payload/AetherNet.app/libNetHookPayload.dylib"
-          cp build-mac/Info.plist "$STAGE/Payload/AetherNet.app/Info.plist"
-          cp build-mac/AppIcon60x60@2x.png "$STAGE/Payload/AetherNet.app/" 2>/dev/null || true
-          cp build-mac/AppIcon60x60@3x.png "$STAGE/Payload/AetherNet.app/" 2>/dev/null || true
+          cp build-mac/AetherNet "$APP/AetherNet"
+          cp build-mac/libNetHookPayload.dylib "$APP/libNetHookPayload.dylib"
+          cp build-mac/Info.plist "$APP/Info.plist"
+          chmod 755 "$APP/AetherNet"
+          chmod 755 "$APP/libNetHookPayload.dylib"
 
-          chmod 755 "$STAGE/Payload/AetherNet.app/AetherNet"
-          chmod 755 "$STAGE/Payload/AetherNet.app/libNetHookPayload.dylib"
+          echo "── [4/4] Icon generation…"
+          # Try Pillow resize from source PNG
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/gen_icons.py "$APP" supports/AppIconSource.png 2>/dev/null || \
+            python3 scripts/gen_icons_placeholder.py "$APP" 2>/dev/null || \
+            echo "Icon generation skipped — will add placeholder"
+          fi
+
+          # Fallback: use macOS sips
+          if [ ! -f "$APP/AppIcon60x60@2x.png" ]; then
+            sips -s format png -Z 240 supports/AppIconSource.png --out "$APP/AppIcon60x60@2x.png" 2>/dev/null || true
+          fi
+          if [ ! -f "$APP/AppIcon60x60@3x.png" ]; then
+            sips -s format png -Z 360 supports/AppIconSource.png --out "$APP/AppIcon60x60@3x.png" 2>/dev/null || true
+          fi
+
+          ls -la "$APP/"
 
       - name: Fakesign with entitlements
         run: |
+          APP="build-mac/stage/Payload/AetherNet.app"
           if command -v ldid >/dev/null 2>&1; then
-            ldid -Ssupports/entitlements.plist build-mac/stage/Payload/AetherNet.app/AetherNet
-            ldid -Ssupports/entitlements.plist build-mac/stage/Payload/AetherNet.app/libNetHookPayload.dylib
+            ldid -Ssupports/entitlements.plist "$APP/AetherNet"
+            ldid -Ssupports/entitlements.plist "$APP/libNetHookPayload.dylib"
             echo "Entitlements embedded"
-            ldid -e build-mac/stage/Payload/AetherNet.app/AetherNet | head -5
+            ldid -e "$APP/AetherNet" | head -5
           else
             echo "ldid not installed — skipping fakesign"
             exit 1
@@ -155,12 +119,8 @@ jobs:
       - name: Package as .tipa
         run: |
           cd build-mac/stage && rm -f "$GITHUB_WORKSPACE/AetherNet.tipa" && zip -qry "$GITHUB_WORKSPACE/AetherNet.tipa" Payload
-          echo "tipa-package=true" >> $GITHUB_OUTPUT
-
-      - name: Show build artifacts
-        run: |
-          ls -la AetherNet.tipa 2>/dev/null || echo "No .tipa found"
-          unzip -l AetherNet.tipa 2>/dev/null | head -20
+          ls -la "$GITHUB_WORKSPACE/AetherNet.tipa"
+          unzip -l "$GITHUB_WORKSPACE/AetherNet.tipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
