@@ -72,7 +72,15 @@ jobs:
 
           echo "── [3/4] Binary build succeeded"
           echo "Verifying critical symbols…"
-          strings build-mac/AetherNet | grep "AetherFloatingToggleButton" | head -3 || echo "WARN: AetherFloatingToggleButton symbol not found!"
+          echo "Checking for AetherFloatingToggleButton (HUD button):"
+          strings build-mac/AetherNet | grep "AetherFloatingToggleButton" | head -3 || echo "FAIL: symbol not found!"
+          echo "Checking for AetherHUDApplicationDelegate (HUD app delegate):"
+          strings build-mac/AetherNet | grep "AetherHUDApplicationDelegate" | head -3 || echo "FAIL: symbol not found!"
+          echo "Checking for AetherMainApplication (app UI):"
+          strings build-mac/AetherNet | grep "AetherMainApplication" | head -3 || echo "FAIL: symbol not found!"
+          echo "Checking for AetherEngineCoordinator (rate ticker):"
+          strings build-mac/AetherNet | grep "AetherEngineCoordinator" | head -3 || echo "FAIL: symbol not found!"
+          echo "Symbol verification complete"
           file build-mac/AetherNet
           file build-mac/libNetHookPayload.dylib
 
