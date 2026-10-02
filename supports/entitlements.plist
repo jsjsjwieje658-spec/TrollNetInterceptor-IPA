@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- =====================================================================
+	     1. CORE TROLLSTORE & UNSANDBOXING ENTITLEMENTS
+	     Grants platform binary trust level & breaks out of the App Sandbox
+	     ===================================================================== -->
+	<key>application-identifier</key>
+	<string>com.aethernet.interceptor</string>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.container-required</key>
+	<false/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<key>file-read-data</key>
+	<true/>
+
+	<!-- =====================================================================
+	     2. ROOT SPAWNING & PRIVILEGE ESCALATION (UID 0 / GID 0)
+	     Required by posix_spawnattr_set_persona_np to spawn HUD daemon
+	     and root helper for Mach / Socket / PF control
+	     ===================================================================== -->
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+
+	<!-- =====================================================================
+	     3. PROCESS ENUMERATION, MACH TASK PORT & DYLIB INJECTION
+	     Allows task_for_pid(), proc_pidfdinfo(), and attaching to target PIDs
+	     ===================================================================== -->
+	<key>task_for_pid-allow</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.system-task-ports</key>
+	<true/>
+	<key>com.apple.system-task-ports.read</key>
+	<true/>
+	<key>com.apple.system-task-ports.send</key>
+	<true/>
+	<key>com.apple.private.kernel.jetsam</key>
+	<true/>
+	<key>com.apple.private.memorystatus</key>
+	<true/>
+	<key>com.apple.springboard.debugApplications</key>
+	<true/>
+	<key>com.apple.backboardd.launchapplications</key>
+	<true/>
+	<key>com.apple.frontboard.launchapplications</key>
+	<true/>
+	<key>com.apple.lsapplicationworkspace.rebuildappdatabases</key>
+	<true/>
+
+	<!-- =====================================================================
+	     4. SYSTEM-WIDE FLOATING HUD WINDOW & HID TOUCH INTERCEPTION
+	     Borrowed from assistivetouchd / TrollSpeed architecture to render an
+	     always-on-top UIWindow (windowLevel = 10000010) over all processes
+	     ===================================================================== -->
+	<key>com.apple.springboard.accessibility-window-hosting</key>
+	<true/>
+	<key>com.apple.backboard.client</key>
+	<true/>
+	<key>com.apple.QuartzCore.displayable-context</key>
+	<true/>
+	<key>com.apple.QuartzCore.secure-mode</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-dispatch</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-filter</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-monitor</key>
+	<true/>
+	<key>com.apple.private.hid.client.service-protected</key>
+	<true/>
+	<key>com.apple.private.hid.manager.client</key>
+	<true/>
+	<key>com.apple.private.allow-background-haptics</key>
+	<true/>
+	<key>com.apple.springboard.appbackgroundstyle</key>
+	<true/>
+	<key>com.apple.springboard.CFUserNotification</key>
+	<true/>
+
+	<!-- =====================================================================
+	     5. LOW-LEVEL NETWORK L4 (TCP/UDP) SOCKET & NECP / PF INTERCEPTION
+	     Allows inspecting per-PID sockets, NECP policies, and packet shaping
+	     ===================================================================== -->
+	<key>com.apple.private.network.socket-delegate</key>
+	<true/>
+	<key>com.apple.private.necp.match</key>
+	<true/>
+	<key>com.apple.private.necp.policies</key>
+	<true/>
+	<key>com.apple.networkd.modify_settings</key>
+	<true/>
+	<key>com.apple.private.networkextension.configuration</key>
+	<true/>
+
+	<!-- =====================================================================
+	     6. PREFERENCES & IPC
+	     ===================================================================== -->
+	<key>user-preference-read</key>
+	<true/>
+	<key>user-preference-write</key>
+	<true/>
+</dict>
+</plist>
