@@ -1,146 +1,166 @@
-name: Build AetherNet
+name: Build AetherNet IPA
+
+# =============================================================================
+#  Replicates the local Linux cross-build pipeline exactly:
+#    1. clang 19 + lld 19 (+ ld64.lld symlink for Mach-O linking)
+#    2. iPhoneOS16.5.sdk from theos/sdks (sparse clone, no full checkout)
+#    3. ldid (Procursus release binary)
+#    4. scripts/crossbuild-linux.sh  →  AetherNet.tipa / .ipa
+#    5. Mach-O symbol-table + signature verification (fails the build loudly)
+# =============================================================================
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
+    tags: [ 'v*' ]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
+env:
+  AETHER_SDK: ${{ github.workspace }}/.deps/sdk-repo/iPhoneOS16.5.sdk
+  AETHER_LDID: ${{ github.workspace }}/.deps/ldid
+
 jobs:
-  build-macOS:
-    name: Build iOS IPA (macOS)
-    runs-on: macos-latest
+  build:
+    name: Cross-build AetherNet.tipa (arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install cross toolchain (clang 19 + lld 19)
         run: |
-          brew install ldid
-          pip3 install Pillow 2>/dev/null || true
+          CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          sudo install -d /etc/apt/keyrings
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor | sudo tee "/etc/apt/keyrings/llvm.gpg" >/dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm19.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-19 lld-19
+          # clang invokes these unversioned names when linking Mach-O targets
+          sudo ln -sf /usr/bin/clang-19    /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-19  /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/ld64.lld-19 /usr/local/bin/ld64.lld
+          clang --version | head -1
+          ld64.lld -v 2>&1 | head -1 || true
 
-      - name: Cross-build with clang
-        id: build
+      - name: Provision iPhoneOS16.5.sdk (theos/sdks sparse clone)
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
-          if [ -z "$SDK_PATH" ]; then
-            echo "iPhoneOS SDK not available — cannot cross-build"
-            exit 1
-          fi
-          echo "Using SDK: $SDK_PATH"
-          CLANG=$(xcrun --find clang 2>/dev/null || which clang)
-          echo "Clang: $CLANG"
-          TARGET="-target arm64-apple-ios14.0"
-          MINOS="-mios-version-min=14.0"
-          COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK_PATH -I./headers -O2 -g0 -fmessage-length=0 -pipe -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function -Wno-objc-designated-initializers -Wno-nullability-completeness -Wno-incomplete-umbrella"
-          MMFLAGS="$COMMON_FLAGS -x objective-c++ -std=gnu++17 -fobjc-arc -fobjc-weak"
-          CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
-          mkdir -p build-mac
+          mkdir -p .deps
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git .deps/sdk-repo
+          cd .deps/sdk-repo
+          git sparse-checkout set iPhoneOS16.5.sdk
+          test -f iPhoneOS16.5.sdk/usr/include/unistd.h || {
+            echo "::error::iPhoneOS16.5.sdk incomplete after sparse checkout"; exit 1; }
+          echo "SDK ready: $(du -sh iPhoneOS16.5.sdk | cut -f1)"
 
-          echo "── [1/4] Compiling libNetHookPayload.dylib (arm64)…"
-          $CLANG $MMFLAGS -c Payload/NetHookPayload.mm -o build-mac/NetHookPayload.o 2>&1 || { echo "NetHookPayload.mm FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Payload/fishhook.c       -o build-mac/fishhook.o       2>&1 || { echo "fishhook.c FAIL"; exit 1; }
-          $CLANG $MMFLAGS -c Core/AetherSharedMemory.mm -o build-mac/AetherSharedMemory_dl.o 2>&1 || { echo "AetherSharedMemory(dl) FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_dl.o 2>&1 || { echo "compiler_rt_shim.c(dl) FAIL"; exit 1; }
-          $CLANG $MMFLAGS -DAETHER_LOG_STANDALONE -c Core/AetherLog.mm -o build-mac/AetherLog_dl.o 2>&1 || { echo "AetherLog.mm(dl) FAIL"; exit 1; }
-
-          echo "── Linking dylib…"
-          $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
-            -dynamiclib -Wl,-undefined,dynamic_lookup \
-            -framework Foundation -framework CoreFoundation -lobjc -lc++ \
-            build-mac/NetHookPayload.o build-mac/fishhook.o build-mac/AetherSharedMemory_dl.o build-mac/compiler_rt_shim_dl.o build-mac/AetherLog_dl.o \
-            -o build-mac/libNetHookPayload.dylib 2>&1 || { echo "DYLIB LINK FAIL"; exit 1; }
-
-          echo "── [2/4] Compiling AetherNet executable (arm64)…"
-          # main.mm uses #import of other .mm/.m files (single-binary pattern).
-          # We compile main.mm as the sole translation unit. Note: -dead_strip is
-          # NOT used here because it would strip classes like AetherFloatingToggleButton
-          # that are only referenced indirectly via objc_getClass/NSInvocation in
-          # the HUD plugin-mode bootstrap path.
-          $CLANG $MMFLAGS -c main.mm -o build-mac/main.o 2>&1 || { echo "main.mm FAIL"; exit 1; }
-          $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
-
-          echo "── Linking executable…"
-          $CLANG $TARGET $MINOS -isysroot $SDK_PATH \
-            -Wl,-undefined,dynamic_lookup \
-            -ObjC -all_load \
-            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework CoreFoundation \
-            -lobjc -lc++ \
-            build-mac/main.o build-mac/compiler_rt_shim_app.o \
-            -o build-mac/AetherNet 2>&1 || { echo "EXECUTABLE LINK FAIL"; exit 1; }
-
-          echo "── [3/4] Binary build succeeded"
-          echo "Verifying critical symbols…"
-          echo "Checking for AetherFloatingToggleButton (HUD button):"
-          strings build-mac/AetherNet | grep "AetherFloatingToggleButton" | head -3 || echo "FAIL: symbol not found!"
-          echo "Checking for AetherHUDApplicationDelegate (HUD app delegate):"
-          strings build-mac/AetherNet | grep "AetherHUDApplicationDelegate" | head -3 || echo "FAIL: symbol not found!"
-          echo "Checking for AetherMainApplication (app UI):"
-          strings build-mac/AetherNet | grep "AetherMainApplication" | head -3 || echo "FAIL: symbol not found!"
-          echo "Checking for AetherEngineCoordinator (rate ticker):"
-          strings build-mac/AetherNet | grep "AetherEngineCoordinator" | head -3 || echo "FAIL: symbol not found!"
-          echo "Symbol verification complete"
-          file build-mac/AetherNet
-          file build-mac/libNetHookPayload.dylib
-
-      - name: Generate Info.plist
+      - name: Provision ldid (Procursus release)
         run: |
-          python3 scripts/gen_info_plist.py build-mac/Info.plist
+          curl -sL -o .deps/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          chmod +x .deps/ldid
+          .deps/ldid 2>&1 | head -1
 
-      - name: Stage IPA bundle
+      - name: Build (crossbuild-linux.sh)
         run: |
-          STAGE="build-mac/stage"
-          APP="$STAGE/Payload/AetherNet.app"
-          rm -rf "$STAGE"
-          mkdir -p "$APP"
+          chmod +x scripts/crossbuild-linux.sh
+          bash scripts/crossbuild-linux.sh
+          test -f AetherNet.tipa || { echo "::error::AetherNet.tipa not produced"; exit 1; }
+          ls -la AetherNet.tipa build-linux/stage/Payload/AetherNet.app/
 
-          cp build-mac/AetherNet "$APP/AetherNet"
-          cp build-mac/libNetHookPayload.dylib "$APP/libNetHookPayload.dylib"
-          cp build-mac/Info.plist "$APP/Info.plist"
-          chmod 755 "$APP/AetherNet"
-          chmod 755 "$APP/libNetHookPayload.dylib"
-
-          echo "── [4/4] Icon generation…"
-          # Try Pillow resize from source PNG
-          if command -v python3 >/dev/null 2>&1; then
-            python3 scripts/gen_icons.py "$APP" supports/AppIconSource.png 2>/dev/null || \
-            python3 scripts/gen_icons_placeholder.py "$APP" 2>/dev/null || \
-            echo "Icon generation skipped — will add placeholder"
-          fi
-
-          # Fallback: use macOS sips
-          if [ ! -f "$APP/AppIcon60x60@2x.png" ]; then
-            sips -s format png -Z 240 supports/AppIconSource.png --out "$APP/AppIcon60x60@2x.png" 2>/dev/null || true
-          fi
-          if [ ! -f "$APP/AppIcon60x60@3x.png" ]; then
-            sips -s format png -Z 360 supports/AppIconSource.png --out "$APP/AppIcon60x60@3x.png" 2>/dev/null || true
-          fi
-
-          ls -la "$APP/"
-
-      - name: Fakesign with entitlements
+      - name: Verify Mach-O symbol tables (classes / shim / IOHID extern "C")
         run: |
-          APP="build-mac/stage/Payload/AetherNet.app"
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -Ssupports/entitlements.plist "$APP/AetherNet"
-            ldid -Ssupports/entitlements.plist "$APP/libNetHookPayload.dylib"
-            echo "Entitlements embedded"
-            ldid -e "$APP/AetherNet" | head -5
-          else
-            echo "ldid not installed — skipping fakesign"
-            exit 1
-          fi
+          python3 - <<'PYEOF'
+          import struct, sys
 
-      - name: Package as .tipa
+          def load_syms(path):
+              with open(path, 'rb') as f:
+                  d = f.read()
+              ncmds = struct.unpack_from("<I", d, 16)[0]
+              off = 32
+              symoff = nsyms = stroff = 0
+              for _ in range(ncmds):
+                  cmd, cs = struct.unpack_from("<II", d, off)
+                  if cmd == 0x2:  # LC_SYMTAB
+                      symoff, nsyms, stroff = struct.unpack_from("<III", d, off + 8)
+                      break
+                  off += cs
+              else:
+                  print(f"::{ 'error' }::no LC_SYMTAB in {path}"); sys.exit(1)
+              defined, undef = set(), []
+              for i in range(nsyms):
+                  o = symoff + i * 16
+                  x, t, sct, ds, v = struct.unpack_from("<IBBHQ", d, o)
+                  e = d.index(b'\0', stroff + x)
+                  name = d[stroff + x:e].decode(errors='replace')
+                  if (t & 0x0e) == 0:
+                      undef.append(name)
+                  else:
+                      defined.add(name)
+              return defined, undef
+
+          failed = False
+          for path in ["build-linux/stage/Payload/AetherNet.app/AetherNet",
+                       "build-linux/stage/Payload/AetherNet.app/libNetHookPayload.dylib"]:
+              defined, undef = load_syms(path)
+              print(f"── {path.split('/')[-1]}")
+              missing = [x for x in undef
+                         if x.startswith("_OBJC_CLASS_$_")
+                         and x[14:].startswith(("Aether", "HUD", "TS", "AX"))]
+              print("   missing app classes:", missing or "NONE ✔")
+              shim = "OK ✔" if any("PlatformVersionAtLeast" in x for x in defined) else "MISSING!"
+              print("   compiler-rt shim:", shim)
+              mangled = [x for x in undef if x.startswith("__Z") and "IOHID" in x]
+              print("   C++-mangled IOHID undefs:", mangled or "none ✔")
+              if missing or shim != "OK ✔" or mangled:
+                  failed = True
+
+          import plistlib
+          info = plistlib.load(open("build-linux/stage/Payload/AetherNet.app/Info.plist", "rb"))
+          ver, bld = info["CFBundleShortVersionString"], info["CFBundleVersion"]
+          print(f"── version {ver} (build {bld})")
+          if failed:
+              print("::error::symbol verification FAILED"); sys.exit(1)
+          print("── symbol verification PASSED ✔")
+          PYEOF
+
+      - name: Verify signature + entitlements
         run: |
-          cd build-mac/stage && rm -f "$GITHUB_WORKSPACE/AetherNet.tipa" && zip -qry "$GITHUB_WORKSPACE/AetherNet.tipa" Payload
-          ls -la "$GITHUB_WORKSPACE/AetherNet.tipa"
-          unzip -l "$GITHUB_WORKSPACE/AetherNet.tipa"
+          "$AETHER_LDID" -q build-linux/stage/Payload/AetherNet.app/AetherNet \
+            && echo "signature VALID ✔" || { echo "::error::ldid -q FAILED"; exit 1; }
+          ENT=$("$AETHER_LDID" -e build-linux/stage/Payload/AetherNet.app/AetherNet | head -4)
+          test -n "$ENT" || { echo "::error::entitlements not embedded"; exit 1; }
+          echo "$ENT"
+          cp AetherNet.tipa AetherNet.ipa
 
-      - name: Upload IPA artifact
+      - name: Upload IPA artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AetherNet-tipa
-          path: AetherNet.tipa
-          retention-days: 14
+          name: AetherNet-IPA-${{ github.run_number }}
+          path: |
+            AetherNet.tipa
+            AetherNet.ipa
+          if-no-files-found: error
+
+  release:
+    name: Attach IPA to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: AetherNet-IPA-${{ github.run_number }}
+          path: dist
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AetherNet.tipa
+            dist/AetherNet.ipa
