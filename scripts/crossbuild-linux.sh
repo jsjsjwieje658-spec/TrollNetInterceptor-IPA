@@ -2,16 +2,13 @@
 # =============================================================================
 #  AetherNet — Linux Cross-Build Pipeline (clang 19 + ld64.lld + iPhoneOS SDK)
 #
-#  Produces: build-linux/stage/Payload/AetherNet.app  ->  AetherNet.tipa
+#  Produces: build-linux/stage/Payload/AetherNet.app  →  AetherNet.tipa
 #
-#  Requirements (Ubuntu 24.04):
+#  Requirements:
 #    sudo apt-get install -y clang lld
-#    curl -Lo ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 && chmod +x ldid
+#    curl -Lo ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
 #    git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git
-#      cd sdks && git sparse-checkout set iPhoneOS16.5.sdk
-#
-#  Note: This script uses -fuse-ld=ld64.lld (Mach-O linker). Ensure ld64.lld
-#  is available (from lld package). On Ubuntu, ld64.lld may be a separate symlink.
+#      && cd sdks && git sparse-checkout set iPhoneOS16.5.sdk
 # =============================================================================
 
 set -uo pipefail
@@ -22,30 +19,6 @@ LDID="${AETHER_LDID:-/home/user/.cache/ldid}"
 OUT="$ROOT/build-linux"
 STAGE="$OUT/stage"
 APP="$STAGE/Payload/AetherNet.app"
-
-# Detect available Mach-O linker (ld64.lld from LLVM LLD)
-LNK=""
-for linker in ld64.lld-19 ld64.lld; do
-    if command -v "$linker" >/dev/null 2>&1; then
-        LNK="-fuse-ld=$linker"
-        echo "Using Mach-O linker: $linker"
-        break
-    fi
-done
-if [ -z "$LNK" ]; then
-    for p in /usr/bin/ld64.lld* /usr/local/bin/ld64.lld*; do
-        if [ -x "$p" ]; then
-            LNK="-fuse-ld=$(basename "$p")"
-            echo "Using Mach-O linker: $p"
-            break
-        fi
-    done
-fi
-if [ -z "$LNK" ]; then
-    echo "WARNING: ld64.lld not found — using default linker"
-    LNK=""
-fi
-echo "Linker flags: $LNK"
 
 CC=clang
 CXX=clang++
@@ -62,7 +35,11 @@ MMFLAGS="$COMMON_FLAGS -x objective-c++ -std=gnu++17 -fobjc-arc -fobjc-weak"
 CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
 
 # Module: libNetHookPayload.dylib (injected L4 hooks)
-DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherSharedMemory_dl.o" "$OUT/compiler_rt_shim_dl.o" "$OUT/AetherLog_dl.o")
+DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherLog_dl.o")
+# Module: AetherNet executable (main dispatcher → app UI + HUD plugin mode)
+APP_OBJS=("$OUT/main.o" "$OUT/AetherSharedMemory.o" "$OUT/ProcessManager.o" \
+          "$OUT/MachInjector.o" "$OUT/DopamineBridge.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
+          "$OUT/SettingsViewController.o" "$OUT/AetherGoldButton.o" "$OUT/AetherLog.o")
 
 mkdir -p "$OUT" "$APP"
 
@@ -71,53 +48,47 @@ $CC $MMFLAGS -c "$ROOT/Payload/NetHookPayload.mm" -o "$OUT/NetHookPayload.o" || 
 $CC $CFLAGS   -c "$ROOT/Payload/fishhook.c"       -o "$OUT/fishhook.o"       || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/AetherSharedMemory.mm" -o "$OUT/AetherSharedMemory_dl.o" || exit 1
 $CC $CFLAGS   -c "$ROOT/Core/compiler_rt_shim.c"  -o "$OUT/compiler_rt_shim_dl.o" || exit 1
+DYLIB_OBJS+=("$OUT/AetherSharedMemory_dl.o" "$OUT/compiler_rt_shim_dl.o")
 $CC $MMFLAGS -DAETHER_LOG_STANDALONE -c "$ROOT/Core/AetherLog.mm" -o "$OUT/AetherLog_dl.o" || exit 1
 
-echo "── Linking dylib…"
-$CXX $TARGET $MINOS -isysroot $SDK $LNK \
-    -dynamiclib -Wl,-undefined,dynamic_lookup \
-    -framework Foundation -framework CoreFoundation -lobjc -lc++ \
-    "${DYLIB_OBJS[@]}" -o "$OUT/libNetHookPayload.dylib" || exit 1
-
 echo "── [2/4] Compiling AetherNet executable (arm64)…"
+$CC $MMFLAGS -c "$ROOT/main.mm"                       -o "$OUT/main.o"                || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/AetherSharedMemory.mm"    -o "$OUT/AetherSharedMemory.o"  || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/ProcessManager.mm"        -o "$OUT/ProcessManager.o"      || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/MachInjector.mm"          -o "$OUT/MachInjector.o"        || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/DopamineBridge.mm"        -o "$OUT/DopamineBridge.o"      || exit 1
+$CC $MMFLAGS -c "$ROOT/HUD/FloatingToggleButton.mm"   -o "$OUT/FloatingToggleButton.o" || exit 1
+$CC $MMFLAGS -c "$ROOT/HUD/HUDMainWindow.mm"          -o "$OUT/HUDMainWindow.o"        || exit 1
+$CC $MMFLAGS -c "$ROOT/HUD/IOHIDEventKIF.m"           -o "$OUT/IOHIDEventKIF.o"        || exit 1
+$CC $MMFLAGS -c "$ROOT/HUD/UITouchKIFAdditions.m"     -o "$OUT/UITouchKIFAdditions.o"  || exit 1
+$CC $MMFLAGS -c "$ROOT/HUD/TSEventFetcher.mm"         -o "$OUT/TSEventFetcher.o"       || exit 1
+$CC $CFLAGS   -c "$ROOT/Core/compiler_rt_shim.c"  -o "$OUT/compiler_rt_shim_app.o" || exit 1
+APP_OBJS+=("$OUT/FloatingToggleButton.o" "$OUT/HUDMainWindow.o" \
+          "$OUT/IOHIDEventKIF.o" "$OUT/UITouchKIFAdditions.o" "$OUT/TSEventFetcher.o")
+APP_OBJS+=("$OUT/compiler_rt_shim_app.o")
+$CC $MMFLAGS -c "$ROOT/UI/AppTheme.mm"                -o "$OUT/AppTheme.o"            || exit 1
+$CC $MMFLAGS -c "$ROOT/UI/HomeViewController.mm"      -o "$OUT/HomeViewController.o"  || exit 1
+$CC $MMFLAGS -c "$ROOT/UI/SettingsViewController.mm"  -o "$OUT/SettingsViewController.o" || exit 1
+$CC $MMFLAGS -c "$ROOT/UI/AetherGoldButton.mm"        -o "$OUT/AetherGoldButton.o"     || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/AetherLog.mm"             -o "$OUT/AetherLog.o"            || exit 1
 
-# main.mm uses #import "HUD/HUDMain.mm" and #import "UI/MainApp.mm" — it pulls
-# in ALL other .mm/.m source files directly as a single translation unit.
-# Compiling those files separately causes duplicate symbol errors, so we
-# only compile main.mm (which transitively includes everything).
-# Note: NO -dead_strip here — it strips classes only referenced via
-# objc_getClass/NSInvocation (e.g. AetherFloatingToggleButton in HUD mode).
-$CC $MMFLAGS -c "$ROOT/main.mm" -o "$OUT/main.o" || exit 1
+echo "── [3/4] Linking (ld64.lld, undefined=dynamic_lookup)…"
+# Dylib: public Foundation only; everything else resolves at runtime via dyld
+$CXX $TARGET $MINOS -isysroot $SDK -fuse-ld=lld \
+    -dynamiclib -Wl,-undefined,dynamic_lookup \
+    -framework Foundation -lobjc -lc++ \
+    "${DYLIB_OBJS[@]}" -o "$APP/libNetHookPayload.dylib" || exit 1
 
-# compiler_rt_shim (for app executable)
-$CC $CFLAGS -c "$ROOT/Core/compiler_rt_shim.c" -o "$OUT/compiler_rt_shim_app.o" || exit 1
-
-echo "── Linking executable…"
-$CXX $TARGET $MINOS -isysroot $SDK $LNK \
-    -Wl,-undefined,dynamic_lookup -ObjC -all_load \
-    -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework CoreFoundation \
+# Executable: UIKit UI app; private SPI (GSInitialize/BKS*/persona) left for dyld
+$CXX $TARGET $MINOS -isysroot $SDK -fuse-ld=lld \
+    -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
+    -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
     -lobjc -lc++ \
-    "$OUT/main.o" "$OUT/compiler_rt_shim_app.o" \
-    -o "$OUT/AetherNet" || exit 1
-
-echo "── [3/4] Binary build succeeded"
-file "$OUT/AetherNet"
-file "$OUT/libNetHookPayload.dylib"
-
-echo "── Verifying symbols…"
-strings "$OUT/AetherNet" | grep "AetherFloatingToggleButton" | head -1 || echo "WARNING: AetherFloatingToggleButton not found in binary"
+    "${APP_OBJS[@]}" -o "$APP/AetherNet" || exit 1
 
 echo "── [4/4] Staging .app + fakesigning entitlements…"
-STAGE_DIR="$STAGE"
-mkdir -p "$APP"
-
-# Copy binary + dylib into .app bundle
-cp "$OUT/AetherNet" "$APP/AetherNet"
-cp "$OUT/libNetHookPayload.dylib" "$APP/libNetHookPayload.dylib"
-chmod 755 "$APP/AetherNet" "$APP/libNetHookPayload.dylib"
-
 # Info.plist for the bundle
-python3 - "$APP/Info.plist" <<'PYEOF'
+python3 - "$APP/Info.plist" <<'PYEOF' || exit 1
 import plistlib, sys
 info = {
     "CFBundleDevelopmentRegion": "en",
@@ -125,6 +96,8 @@ info = {
     "CFBundleExecutable": "AetherNet",
     "CFBundleIcons": {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["AppIcon60x60"]}},
     "CFBundleIdentifier": "com.aethernet.interceptor",
+    "UIFileSharingEnabled": True,
+    "LSSupportsOpeningDocumentsInPlace": True,
     "CFBundleInfoDictionaryVersion": "6.0",
     "CFBundleName": "AetherNet",
     "CFBundlePackageType": "APPL",
@@ -150,6 +123,14 @@ with open(sys.argv[1], "wb") as f:
     plistlib.dump(info, f)
 PYEOF
 
+chmod 755 "$APP/AetherNet" "$APP/libNetHookPayload.dylib"
+
+
+
+# Embed arbitrary TrollStore entitlements into both binaries
+"$LDID" -S"$ROOT/supports/entitlements.plist" "$APP/AetherNet"               || exit 1
+"$LDID" -S"$ROOT/supports/entitlements.plist" "$APP/libNetHookPayload.dylib" || exit 1
+
 # App icon (generated, resized via Pillow) if available
 ICON_SRC="$ROOT/supports/AppIconSource.png"
 if [ -f "$ICON_SRC" ]; then
@@ -162,29 +143,10 @@ for size, name in ((120, "AppIcon60x60@2x.png"), (180, "AppIcon60x60@3x.png")):
 PYEOF
 fi
 
-# Fallback: create placeholder icons if Pillow generation failed
-if [ ! -f "$APP/AppIcon60x60@2x.png" ]; then
-    python3 -c "
-from PIL import Image
-img = Image.new('RGBA', (120, 120), (231, 197, 122, 255))
-img.save('$APP/AppIcon60x60@2x.png')
-img2 = Image.new('RGBA', (180, 180), (231, 197, 122, 255))
-img2.save('$APP/AppIcon60x60@3x.png')
-" 2>/dev/null || echo "WARNING: Could not generate placeholder icons"
-fi
-
-# Verify files in .app bundle
-echo "── Files in .app bundle:"
-ls -la "$APP/"
-
-# Embed arbitrary TrollStore entitlements into both binaries
-"$LDID" -S"$ROOT/supports/entitlements.plist" "$APP/AetherNet"               || exit 1
-"$LDID" -S"$ROOT/supports/entitlements.plist" "$APP/libNetHookPayload.dylib" || exit 1
-
 # Verify entitlements embedded
 "$LDID" -e "$APP/AetherNet" | head -4 >/dev/null && echo "   entitlements embedded ✔"
 
 # Package TrollStore .tipa
-cd "$STAGE_DIR" && rm -f "$ROOT/AetherNet.tipa" && zip -qry "$ROOT/AetherNet.tipa" Payload
+cd "$STAGE" && rm -f "$ROOT/AetherNet.tipa" && zip -qry "$ROOT/AetherNet.tipa" Payload
 
 echo "── Done: $ROOT/AetherNet.tipa"

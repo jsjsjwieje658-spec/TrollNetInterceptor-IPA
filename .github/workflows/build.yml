@@ -44,9 +44,13 @@ jobs:
           sudo ln -sf /usr/bin/clang-19    /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-19  /usr/local/bin/clang++
           # ld64.lld-19 is the Mach-O linker from LLVM LLD
+          # clang -fuse-ld=lld on Mach-O targets searches PATH for an
+          # UNVERSIONED 'ld64.lld' — clang rejects versioned names outright.
           if [ -f /usr/bin/ld64.lld-19 ]; then
             sudo ln -sf /usr/bin/ld64.lld-19 /usr/local/bin/ld64.lld
           fi
+          command -v ld64.lld >/dev/null || { echo "::error::ld64.lld not resolvable"; exit 1; }
+          ld64.lld -v 2>&1 | head -1 || true
           clang --version | head -1
           echo "ld64.lld-19 location: $(which ld64.lld-19 2>/dev/null || echo 'not found')"
 
@@ -71,6 +75,12 @@ jobs:
             https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
           chmod +x .deps/ldid
           .deps/ldid 2>&1 | head -1
+
+      - name: Install Pillow (icon generation)
+        run: |
+          python3 -m pip install --break-system-packages --quiet Pillow \
+            || python3 -m pip install --quiet Pillow
+          python3 -c "import PIL; print('Pillow', PIL.__version__)"
 
       - name: Build (crossbuild-linux.sh)
         run: |
