@@ -20,32 +20,7 @@ jobs:
           brew install ldid
           brew install xcodegen || true
 
-      - name: Generate Xcode project
-        run: |
-          if command -v xcodegen >/dev/null 2>&1; then
-            xcodegen generate
-          fi
-
-      - name: Build (xcodebuild)
-        run: |
-          set -o pipefail
-          # Attempt xcodebuild if xcodeproj exists
-          if [ -f AetherNet.xcodeproj/project.pbxproj ]; then
-            xcodebuild -project AetherNet.xcodeproj \
-              -scheme AetherNet \
-              -configuration Release \
-              -sdk iphoneos \
-              -derivedDataPath build \
-              ARCHS=arm64 \
-              ONLY_ACTIVE_ARCH=YES \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGN_IDENTITY= \
-              clean build 2>&1 | tail -50
-          else
-            echo "No xcodeproj found — skipping xcodebuild (xcodegen may not have generated project.yml)"
-          fi
-
-      - name: Cross-build with clang (Linux toolchain sim on macOS)
+      - name: Cross-build with clang
         run: |
           # Attempt to use the crossbuild script logic adapted for macOS runner
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
@@ -88,8 +63,8 @@ jobs:
           $CLANG $MMFLAGS                -c HUD/HUDMain.mm               -o build-mac/HUDMain.o 2>&1 || { echo "HUDMain.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS                -c HUD/HUDRootApplication.mm    -o build-mac/HUDRootApplication.o 2>&1 || { echo "HUDRootApplication.mm FAIL"; exit 1; }
           $CLANG $MMFLAGS                -c HUD/TSEventFetcher.mm        -o build-mac/TSEventFetcher.o 2>&1 || { echo "TSEventFetcher.mm FAIL"; exit 1; }
-          $CLANG         -x objective-c++ -c HUD/UITouchKIFAdditions.m  -o build-mac/UITouchKIFAdditions.o 2>&1 || { echo "UITouchKIFAdditions.m FAIL"; exit 1; }
-          $CLANG         -x objective-c++ -c HUD/IOHIDEventKIF.m        -o build-mac/IOHIDEventKIF.o 2>&1 || { echo "IOHIDEventKIF.m FAIL"; exit 1; }
+          $CLANG $MMFLAGS                -c HUD/UITouchKIFAdditions.m    -o build-mac/UITouchKIFAdditions.o 2>&1 || { echo "UITouchKIFAdditions.m FAIL"; exit 1; }
+          $CLANG $MMFLAGS                -c HUD/IOHIDEventKIF.m          -o build-mac/IOHIDEventKIF.o 2>&1 || { echo "IOHIDEventKIF.m FAIL"; exit 1; }
           $CLANG $CFLAGS   -c Core/compiler_rt_shim.c  -o build-mac/compiler_rt_shim_app.o 2>&1 || { echo "compiler_rt_shim_app FAIL"; exit 1; }
 
           # Link dylib
