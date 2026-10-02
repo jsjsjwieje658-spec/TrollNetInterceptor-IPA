@@ -20,23 +20,13 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <xpc/xpc.h>
 #include "DopamineBridge.h"
 
 // ---------------------------------------------------------------------------
-// Private libxpc SPI (resolved via dynamic_lookup at runtime)
+// xpc types — use the real xpc_object_t from the SDK (not void *)
 // ---------------------------------------------------------------------------
-typedef void *xpc_t;
-
-extern "C" {
-extern xpc_t    xpc_dictionary_create_empty(void);
-extern void     xpc_dictionary_set_uint64(xpc_t, const char *, uint64_t);
-extern void     xpc_dictionary_set_bool(xpc_t, const char *, bool);
-extern int64_t  xpc_dictionary_get_int64(xpc_t, const char *);
-extern const char *xpc_dictionary_get_string(xpc_t, const char *);
-extern void     xpc_release(xpc_t);
-extern xpc_t    xpc_pipe_create_from_port(mach_port_t, uint64_t flags);
-extern int      xpc_pipe_routine_with_flags(xpc_t pipe, xpc_t message, xpc_t *reply, uint32_t flags);
-}
+typedef xpc_object_t xpc_t;
 
 // ---------------------------------------------------------------------------
 // Dopamine jbserver domains & actions (jbserver_domains.h, branch 3.x)
