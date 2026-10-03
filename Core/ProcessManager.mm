@@ -488,6 +488,11 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
                     aether_atomic_store(&state->isInjected, true);
                     aether_atomic_store(&state->injectionMethod, 2);
                     AetherLog(@"LIVE attach FAILED — falling back to Root PF engine (no packet capture, shaping only)");
+                    if (dopamineAssisted) {
+                        AetherLog(@"Note: Dopamine trust/debug was applied but task_for_pid still failed (0x5=KERN_FAILURE).");
+                        AetherLog(@"This typically means target is a PPL (Platform Process) that rootless Dopamine cannot bypass.");
+                        AetherLog(@"Socket telemetry monitor (Tier 3) will track TCP/UDP socket counts via proc_pidinfo.");
+                    }
                 }
             }
         }
