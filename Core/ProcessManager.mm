@@ -2,10 +2,15 @@
 //  ProcessManager.mm
 //  AetherNet — Process Enumeration, XNU Socket Telemetry & HUD Spawner
 //
+//  4-Tier Packet Capture Architecture:
+//    Tier 0: NECP (Network Extension Control Plane) — kernel-level filter, no injection
+//    Tier 1: Mach + fishhook (BSD sockets) — libNetHookPayload.dylib hooks send/recv
+//    Tier 2: libnetwork.dylib hook (nw_* APIs) — modern Network.framework apps
+//    Tier 3: Root PF/Dummynet — traffic shaping fallback (no packet capture)
+//
 
 #import "ProcessManager.h"
 #import "AetherLog.h"
-#import "DopamineBridge.h"
 #import "../headers/PrivateSystemSPI.h"
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -18,10 +23,16 @@
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 #include <signal.h>
+#include <netinet/in.h>
 
 extern "C" char **environ;
 extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *errBuf, size_t errBufLen);
 extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state);
+
+// NECP C interface (implemented in NECPCapture.mm)
+extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen);
+extern "C" void AetherNECPStopCapture(void);
+extern "C" BOOL AetherNECPIsRunning(void);
 
 @implementation AetherProcessInfo
 @end
@@ -72,7 +83,6 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
         return @[];
     }
 
-    // Add slack for newly spawned processes
     bufSize += sizeof(struct kinfo_proc) * 32;
     struct kinfo_proc *procs = (struct kinfo_proc *)calloc(1, bufSize);
     if (!procs) return @[];
@@ -141,8 +151,8 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
 
                 if ([UIImage respondsToSelector:@selector(_applicationIconImageForBundleIdentifier:format:scale:)]) {
                     info.appIcon = [UIImage _applicationIconImageForBundleIdentifier:info.bundleIdentifier
-                                                                              format:0
-                                                                               scale:[UIScreen mainScreen].scale];
+                                                                          format:0
+                                                                           scale:[UIScreen mainScreen].scale];
                 }
             }
         }
@@ -153,7 +163,7 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
         info.tcpSocketCount = tcpCount;
         info.udpSocketCount = udpCount;
 
-        // Apply search query filter if non-empty
+        // Apply search query filter
         if (searchQuery.length > 0) {
             NSString *q = [searchQuery lowercaseString];
             BOOL matchName = [[info.displayName lowercaseString] containsString:q] ||
@@ -168,7 +178,7 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
 
     free(procs);
 
-    // Sort: User apps first, then processes with active UDP/TCP sockets, then by displayName
+    // Sort: User apps first, then processes with active sockets, then by name
     [result sortUsingComparator:^NSComparisonResult(AetherProcessInfo *a, AetherProcessInfo *b) {
         if (a.isUserApp != b.isUserApp) {
             return a.isUserApp ? NSOrderedAscending : NSOrderedDescending;
@@ -274,8 +284,31 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     state->socketEntryCount = entryIdx;
 }
 
+#pragma mark - Packet Capture Tiers
+
+// Tier 0: NECP (kernel-level packet filter) — NO injection required
+- (BOOL)startNECPCaptureForPID:(pid_t)pid error:(NSError * _Nullable * _Nullable)error {
+    char errBuf[256] = {0};
+    int rc = AetherNECPStartCapture(pid, errBuf, sizeof(errBuf));
+    if (rc != 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"AetherNECP" code:rc userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithUTF8String:errBuf]}];
+        }
+        AetherLog(@"NECP start failed for pid %d: %s", pid, errBuf);
+        return NO;
+    }
+    AetherLog(@"NECP capture STARTED for pid %d", pid);
+    return YES;
+}
+
+- (void)stopNECPCapture {
+    AetherNECPStopCapture();
+    AetherLog(@"NECP capture STOPPED");
+}
+
+// Tier 1: Mach + fishhook (BSD socket hooks) — requires task_for_pid
 - (BOOL)injectIntoProcess:(AetherProcessInfo *)processInfo
-                    error:(NSError * _Nullable * _Nullable)error {
+                error:(NSError * _Nullable * _Nullable)error {
     AetherSharedState *state = AetherGetSharedState();
     if (!state) return NO;
 
@@ -287,7 +320,7 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
         [processInfo.executablePath UTF8String]
     );
 
-    // Stage 1: Copy bundled libNetHookPayload.dylib to accessible world-readable path
+    // Stage dylib to world-readable path
     NSString *bundledDylib = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
     if (bundledDylib) {
         [[NSFileManager defaultManager] copyItemAtPath:bundledDylib
@@ -296,30 +329,20 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
         chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
     }
 
-    // Stage 0: Dopamine 3.x PPL-Bypass Bridge (A12+/iOS 15-17.3.1 with Dopamine installed)
-    //   - Trust libNetHookPayload.dylib in the kernel trust cache
-    //   - cs_allow_invalid(target): CS_DEBUGGED + pmap/TXM allowsInvalidCode (Dopamine's PPL fix)
-    //   This is what un-blocks unsigned dylib injection where PPL would normally kill it.
-    BOOL dopamineAssisted = NO;
-    if (AetherDopamineAvailable()) {
-        dopamineAssisted = AetherDopaminePrepareInjection(processInfo.pid, AETHER_DYLIB_INSTALL_PATH);
-    }
-
-    // Stage 2: Attempt Mach Task Thread Injection (task_for_pid -> remote dlopen)
+    // Attempt Mach injection (Tier 1)
     char errBuf[256] = {0};
     int injectRC = AetherInjectDylibIntoPID(processInfo.pid, AETHER_DYLIB_INSTALL_PATH, errBuf, sizeof(errBuf));
-    AetherLog(@"attach inject pid %d rc=%d dopamine=%d err=[%s]",
-              processInfo.pid, injectRC, dopamineAssisted, errBuf);
+    AetherLog(@"Mach inject pid %d rc=%d err=[%s]", processInfo.pid, injectRC, errBuf);
 
     if (injectRC == 0) {
         aether_atomic_store(&state->isInjected, true);
-        aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1); // Dopamine-assisted / plain Mach Dylib Hook
+        aether_atomic_store(&state->injectionMethod, 1); // Mach dylib hooks
     } else {
-        // Fallback Stage 3: Root Socket / Kernel PF + Dummynet per-PID Shaper
-        // Works on all A12+ iOS 15.0 - 17.0 TrollStore devices even with PPL enabled
+        // Tier 3: Root PF fallback (no packet capture, shaping only)
         AetherApplyRootTrafficControl(processInfo.pid, state);
         aether_atomic_store(&state->isInjected, true);
-        aether_atomic_store(&state->injectionMethod, 2); // Root Kernel/Socket Engine
+        aether_atomic_store(&state->injectionMethod, 3); // Root PF engine
+        AetherLog(@"Mach inject failed — falling back to Root PF (no packet capture)");
     }
 
     AetherLog(@"attach pid %d name=%s bundle=%s", processInfo.pid,
@@ -337,6 +360,8 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     aether_atomic_store(&state->interceptionActive, false);
     aether_atomic_store(&state->isInjected, false);
     aether_atomic_store(&state->targetPID, 0);
+    aether_atomic_store(&state->injectionMethod, 0);
+    [self stopNECPCapture];
     notify_post(kAetherNotifyFlushQueue);
     notify_post(kAetherNotifyStateChanged);
 }
@@ -344,16 +369,12 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
 #pragma mark - Global Root Floating HUD Button Management
 
 - (BOOL)isGlobalFloatingHUDRunning {
-    // Channel 1 (primary): shm heartbeat — HUD daemon stamps time(NULL) every 1s.
-    // Works across uid/root and roothide path shadowing (no filesystem trust needed).
     AetherSharedState *state = AetherGetSharedState();
     if (state) {
         uint64_t hb = aether_atomic_load(&state->hudHeartbeatTs);
         if (hb > 0 && (uint64_t)time(NULL) - hb <= 3) return YES;
     }
 
-    // Channel 2 (fallback): pid file + signal probe. App runs as uid 501, HUD
-    // daemon as ROOT — kill(_,0) yields EPERM for an existing privileged process.
     NSString *pidStr = [NSString stringWithContentsOfFile:@AETHER_HUD_PID_PATH
                                                  encoding:NSUTF8StringEncoding
                                                     error:nil];
@@ -379,8 +400,6 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     posix_spawnattr_init(&attr);
 
 #if !TARGET_OS_SIMULATOR
-    // Elevate HUD child daemon to root (UID 0 / GID 0) using com.apple.private.persona-mgmt
-    // Required so SpringBoard does not kill the HUD window upon device lock/unlock
     posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
@@ -408,21 +427,20 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
             aether_atomic_store(&state->hudVisible, true);
         }
     } else {
-        // Primary: graceful exit via shm command channel (the HUD daemon's
-        // heartbeat timer observes this and exit(0)s itself)
+        // Graceful exit via shm command
         if (state) {
             aether_atomic_store(&state->hudCommand, 1);
             aether_atomic_store(&state->hudHeartbeatTs, 0);
             aether_atomic_store(&state->hudVisible, false);
             aether_atomic_store(&state->interceptionActive, false);
-            AetherLog(@"HUD remove command sent (graceful exit + legacy -exit)");
+            AetherLog(@"HUD remove command sent (graceful exit)");
             pid_t fp = aether_atomic_load(&state->rootFrozenPid);
             if (fp > 0) { kill(fp, SIGCONT); aether_atomic_store(&state->rootFrozenPid, 0);
                           AetherLog(@"unfroze pid %d on HUD remove", fp); }
         }
         notify_post(kAetherNotifyHUDToggle);
 
-        // Fallback: legacy -exit re-exec (pid-file based)
+        // Fallback: legacy -exit
         pid_t childPID = 0;
         const char *args[] = { execPath, "-exit", NULL };
         posix_spawn(&childPID, execPath, NULL, &attr, (char **)args, environ);
@@ -440,78 +458,53 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     bool wasActive = aether_atomic_exchange(&state->interceptionActive, active);
     AetherLog(@"interception %s (was %d)", active ? "START" : "STOP", wasActive);
 
-    // ── Frida-style LIVE attach on demand (user requirement: no respring,
-    // no tweak installation). If the earlier attach-time injection didn't
-    // land (target relaunched / was busy), retry NOW with fresh logs of the
-    // exact Mach failure. The payload announces itself via
-    // "[hook] payload armed in target" in the merged log on success. ──
-    //
-    // Always retry when injectionMethod == 2 (root engine fallback). The
-    // dylib hooks give us real per-packet send/recv interception; the root
-    // PF engine only shapes traffic — it does NOT capture packets. So if
-    // we have Dopamine available and the initial attach fell back to PF,
-    // try the full PPL-bypass + Mach injection again.
     if (active) {
-        uint8_t method = aether_atomic_load(&state->injectionMethod);
-        if (method == 0 || method == 2) {  // not injected at all, or only root engine
-            pid_t targetPID = aether_atomic_load(&state->targetPID);
-            if (targetPID > 0) {
-                // Stage the dylib: copy to accessible world-readable path
-                NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
-                NSString *signedCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
-                NSFileManager *fm = [NSFileManager defaultManager];
-                NSString *use = ([fm fileExistsAtPath:signedCopy]) ? signedCopy : bundled;
-                if (use) {
-                    [fm removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                    [fm copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                    chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
-                }
+        pid_t targetPID = aether_atomic_load(&state->targetPID);
+        if (targetPID > 0) {
+            // Ensure dylib staged
+            NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
+            if (bundled) {
+                [[NSFileManager defaultManager] copyItemAtPath:bundled
+                                                        toPath:@AETHER_DYLIB_INSTALL_PATH
+                                                         error:nil];
+                chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
+            }
 
-                // Tier 0: Dopamine PPL bypass (trust file + cs_allow_invalid) — REQUIRED on PPL devices
-                BOOL dopamineAssisted = NO;
-                if (AetherDopamineAvailable()) {
-                    dopamineAssisted = AetherDopaminePrepareInjection(targetPID, AETHER_DYLIB_INSTALL_PATH);
-                }
+            // Try NECP first (Tier 0) — no injection needed, works on all TrollStore devices
+            if (aether_atomic_load(&state->injectionMethod) == 0) {
+                [self startNECPCaptureForPID:targetPID error:nil];
+            }
 
-                // Tier 1: Mach remote dlopen injection (gives us real socket hook capture)
+            // Then try Mach injection (Tier 1) for full packet detail
+            uint8_t method = aether_atomic_load(&state->injectionMethod);
+            if (method == 0 || method == 3) {  // NECP running or only PF fallback
                 char errBuf2[256] = {0};
                 int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
-                AetherLog(@"LIVE attach pid %d rc=%d dopamine=%d err=[%s]",
-                          targetPID, rc2, dopamineAssisted, errBuf2);
+                AetherLog(@"LIVE Mach attach pid %d rc=%d err=[%s]", targetPID, rc2, errBuf2);
                 if (rc2 == 0) {
                     aether_atomic_store(&state->isInjected, true);
-                    aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1);
-                    AetherLog(@"LIVE attach SUCCESS — payload should announce '[hook] payload armed in target' in merged log");
+                    aether_atomic_store(&state->injectionMethod, 1);
+                    AetherLog(@"Mach hooks ACTIVE — full packet capture enabled");
                 } else if (method == 0) {
-                    // Tier 2: Root PF/Socket engine fallback (only when no prior method)
+                    // NECP running but Mach failed — keep NECP, add PF for shaping
                     AetherApplyRootTrafficControl(targetPID, state);
-                    aether_atomic_store(&state->isInjected, true);
-                    aether_atomic_store(&state->injectionMethod, 2);
-                    AetherLog(@"LIVE attach FAILED — falling back to Root PF engine (no packet capture, shaping only)");
-                    if (dopamineAssisted) {
-                        AetherLog(@"Note: Dopamine trust/debug was applied but task_for_pid still failed (0x5=KERN_FAILURE).");
-                        AetherLog(@"This typically means target is a PPL (Platform Process) that rootless Dopamine cannot bypass.");
-                        AetherLog(@"Socket telemetry monitor (Tier 3) will track TCP/UDP socket counts via proc_pidinfo.");
-                    }
+                    aether_atomic_store(&state->injectionMethod, 4); // NECP + PF
+                    AetherLog(@"Mach failed — NECP + Root PF active");
                 }
             }
         }
     }
 
     if (wasActive && !active) {
-        // Flushing held TCP/UDP packet queue when switching from ⏸ (Pause/Hold) -> ▶ (Play/Release)
         notify_post(kAetherNotifyFlushQueue);
     } else if (!wasActive && active) {
-        // Notify the injected payload that settings may have changed
         notify_post(kAetherNotifyConfigChanged);
     }
 
     pid_t targetPID = aether_atomic_load(&state->targetPID);
     uint8_t method = aether_atomic_load(&state->injectionMethod);
-    if (targetPID > 0 && method == 2) {
+    if (targetPID > 0 && method == 3) {
         AetherApplyRootTrafficControl(targetPID, state);
-        // Start BPF capture for root-engine-only mode (dylib hooks unavailable)
-        // This gives us real packet telemetry even without in-process hooks
         AetherStartBPFCaptureIfAvailable();
     }
 

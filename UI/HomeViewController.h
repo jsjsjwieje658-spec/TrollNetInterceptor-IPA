@@ -8,6 +8,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @interface HomeViewController : UIViewController
+@property (nonatomic, strong) UILabel *boxTitle;
+@property (nonatomic, strong) UILabel *boxSubtitle;
 - (void)reloadFromSharedState;
 @end
 

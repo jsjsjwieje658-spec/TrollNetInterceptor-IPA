@@ -38,7 +38,7 @@ CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
 DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherLog_dl.o")
 # Module: AetherNet executable (main dispatcher → app UI + HUD plugin mode)
 APP_OBJS=("$OUT/main.o" "$OUT/AetherSharedMemory.o" "$OUT/ProcessManager.o" \
-          "$OUT/MachInjector.o" "$OUT/DopamineBridge.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
+          "$OUT/MachInjector.o" "$OUT/NECPCapture.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
           "$OUT/SettingsViewController.o" "$OUT/LogViewController.o" "$OUT/AetherGoldButton.o" "$OUT/AetherLog.o")
 
 mkdir -p "$OUT" "$APP"
@@ -56,7 +56,7 @@ $CC $MMFLAGS -c "$ROOT/main.mm"                       -o "$OUT/main.o"          
 $CC $MMFLAGS -c "$ROOT/Core/AetherSharedMemory.mm"    -o "$OUT/AetherSharedMemory.o"  || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/ProcessManager.mm"        -o "$OUT/ProcessManager.o"      || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/MachInjector.mm"          -o "$OUT/MachInjector.o"        || exit 1
-$CC $MMFLAGS -c "$ROOT/Core/DopamineBridge.mm"        -o "$OUT/DopamineBridge.o"      || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/NECPCapture.mm"           -o "$OUT/NECPCapture.o"         || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/FloatingToggleButton.mm"   -o "$OUT/FloatingToggleButton.o" || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/HUDMainWindow.mm"          -o "$OUT/HUDMainWindow.o"        || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/IOHIDEventKIF.m"           -o "$OUT/IOHIDEventKIF.o"        || exit 1

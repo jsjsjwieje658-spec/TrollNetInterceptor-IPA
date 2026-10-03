@@ -34,9 +34,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// Inspects live L4 TCP/UDP file descriptors of a target PID via XNU libproc SPI
 - (void)refreshSocketTelemetryForPID:(pid_t)pid;
 
-/// Injects libNetHookPayload.dylib into target PID and binds L4 TCP/UDP hooks
+/// Injects libNetHookPayload.dylib into target PID and binds L4 TCP/UDP hooks (Tier 1)
 - (BOOL)injectIntoProcess:(AetherProcessInfo *)processInfo
-                    error:(NSError * _Nullable * _Nullable)error;
+                error:(NSError * _Nullable * _Nullable)error;
+
+/// Starts NECP kernel-level packet capture (Tier 0) — no injection required
+- (BOOL)startNECPCaptureForPID:(pid_t)pid error:(NSError * _Nullable * _Nullable)error;
+
+/// Stops NECP capture
+- (void)stopNECPCapture;
 
 /// Detaches hooks and flushes held packet queues
 - (void)detachFromCurrentProcess;
