@@ -102,52 +102,43 @@ extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *
         ARM_THREAD_STATE64_COUNT,
         &remoteThread
     );
+#else
+    kr = KERN_FAILURE;
+#endif
 
-    if (kr != KERN_SUCCESS) {
-        mach_vm_deallocate(task, remotePath, pathAllocSize);
-        mach_vm_deallocate(task, remoteStack, stackSize);
-        mach_port_deallocate(mach_task_self(), task);
-        snprintf(errBuf, errBufLen, "thread_create_running failed (PPL/PAC active): 0x%x", kr);
+    mach_port_deallocate(mach_task_self(), task);
+    mach_vm_deallocate(task, remotePath, pathAllocSize);
+    mach_vm_deallocate(task, remoteStack, stackSize);
+
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(remoteThread)) {
+        snprintf(errBuf, errBufLen, "thread_create_running failed: 0x%x", kr);
         return -7;
     }
 
     mach_port_deallocate(mach_task_self(), remoteThread);
-#endif
-
-    mach_port_deallocate(mach_task_self(), task);
     return 0;
 }
 
 // ============================================================================
-// 2. Root Kernel PF / Socket Traffic Shaper Fallback (UID 0 via Persona)
-//    Ensures TCP/UDP holding, packet drop %, and latency work on PPL devices
+// 2. Root PF/Dummynet Traffic Shaper (Tier 2 Fallback)
+//    Uses pfctl anchor "com.apple/aethernet" with rules per tracked L4 socket.
+//    Requires: root (UID 0 via posix_spawnattr_set_persona_np) + pf anchor.
 // ============================================================================
 extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state) {
-    if (!state || pid <= 0) return -1;
+    if (!state) return -1;
 
-    bool active = aether_atomic_load(&state->interceptionActive);
-    uint8_t direction = aether_atomic_load(&state->direction);
-    uint8_t protoFilter = aether_atomic_load(&state->protocolFilter);
-    uint8_t mode = aether_atomic_load(&state->interceptMode);
+    AetherTrafficMode mode = (AetherTrafficMode)aether_atomic_load(&state->trafficMode);
     uint32_t ratio = aether_atomic_load(&state->captureRatioPercent);
+    uint32_t delayMs = aether_atomic_load(&state->delayMs);
+    uint32_t jitterMs = aether_atomic_load(&state->jitterMs);
+    uint32_t bwLimitKbps = aether_atomic_load(&state->bandwidthLimitKbps);
+    AetherDirection direction = (AetherDirection)aether_atomic_load(&state->directionFilter);
+    AetherProtocol protoFilter = (AetherProtocol)aether_atomic_load(&state->protocolFilter);
+    bool active = aether_atomic_load(&state->interceptionActive);
 
-    // ── Root Engine capture (3.3.0) ──────────────────────────────────────
-    // SIGSTOP freezing REMOVED per user decision — it froze the target's
-    // whole UI instead of capturing packets. Real L4 TCP/UDP capture is done
-    // by the hook payload that the HUD daemon installs into the roothide
-    // TweakInject directory; ellekit injects it into the target process at
-    // its next launch and the fishhook engine enforces Hold/Drop/Delay.
-    if (active) {
-        static int sLoggedRootActive = 0;
-        if (!sLoggedRootActive) {
-            sLoggedRootActive = 1;
-            AetherLog(@"root engine active pid %d — capture via injected hook payload (no freeze)", pid);
-        }
-    }
-
-    // When active in Hold/Freeze mode with 100% capture, we can also use SIGSTOP/socket buffer
-    // conditioning or PF anchor rules scoped to the target PID's active sockets.
     NSMutableString *pfRule = [NSMutableString string];
+    [pfRule appendString:@"# AetherNet PF rules\n"];
+
     if (active) {
         NSString *protoStr = (protoFilter == AetherProtoUDPOnly) ? @"udp" :
                              (protoFilter == AetherProtoTCPOnly) ? @"tcp" : @"{ tcp, udp }";
@@ -204,17 +195,23 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
 //    Provides real packet-flow visibility when dylib hooks can't inject.
 // ============================================================================
 
+static _Atomic(pid_t) gSocketMonitorActivePID = 0;
+
 static void *AetherSocketTelemetryThread(void *arg) {
     pid_t targetPID = (pid_t)(intptr_t)arg;
     AetherSharedState *state = AetherGetSharedState();
-    if (!state) return NULL;
+    if (!state) {
+        aether_atomic_store(&gSocketMonitorActivePID, 0);
+        return NULL;
+    }
 
-    AetherLogDaemon(@"[socket-monitor] thread started for pid %d", targetPID);
+    AetherLogDaemon(@"[socket-monitor] thread STARTED for pid %d", targetPID);
 
     uint32_t lastTCPCount = 0, lastUDPCount = 0;
     uint64_t totalTCPChanges = 0, totalUDPChanges = 0;
+    uint64_t pollCount = 0;
 
-    while (state && aether_atomic_load(&state->hudVisible)) {
+    while (state && aether_atomic_load(&state->hudVisible) && aether_atomic_load(&gSocketMonitorActivePID) == targetPID) {
         uint8_t currentMethod = aether_atomic_load(&state->injectionMethod);
         if (currentMethod == 1 || currentMethod == 3) {
             AetherLogDaemon(@"[socket-monitor] dylib hooks available (method=%u) — stopping monitor", currentMethod);
@@ -228,9 +225,12 @@ static void *AetherSocketTelemetryThread(void *arg) {
             continue;
         }
 
-        // Enumerate sockets via proc_pidinfo with PROC_PIDLISTFDS (same as ProcessManager)
+        // Enumerate sockets via proc_pidinfo with PROC_PIDLISTFDS
         int bufSize = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, NULL, 0);
         if (bufSize <= 0) {
+            if ((pollCount++ % 50) == 0) { // log every 5s
+                AetherLogDaemon(@"[socket-monitor] pid %d: proc_pidinfo(PROC_PIDLISTFDS) returned %d (errno=%d)", targetPID, bufSize, errno);
+            }
             usleep(100000);
             continue;
         }
@@ -244,6 +244,9 @@ static void *AetherSocketTelemetryThread(void *arg) {
         int actual = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, fds, bufSize);
         if (actual <= 0) {
             free(fds);
+            if ((pollCount++ % 50) == 0) {
+                AetherLogDaemon(@"[socket-monitor] pid %d: proc_pidinfo returned %d (errno=%d)", targetPID, actual, errno);
+            }
             usleep(100000);
             continue;
         }
@@ -272,23 +275,31 @@ static void *AetherSocketTelemetryThread(void *arg) {
         if (tcpCount != lastTCPCount || udpCount != lastUDPCount) {
             totalTCPChanges += (tcpCount != lastTCPCount) ? 1 : 0;
             totalUDPChanges += (udpCount != lastUDPCount) ? 1 : 0;
-            AetherLogDaemon(@"[socket-monitor] sockets changed: TCP=%u UDP=%u (was TCP=%u UDP=%u)",
-                            tcpCount, udpCount, lastTCPCount, lastUDPCount);
+            AetherLogDaemon(@"[socket-monitor] pid %d: sockets CHANGED: TCP=%u UDP=%u (was TCP=%u UDP=%u)",
+                            targetPID, tcpCount, udpCount, lastTCPCount, lastUDPCount);
             lastTCPCount = tcpCount;
             lastUDPCount = udpCount;
             aether_atomic_store(&state->activeTCPSockets, tcpCount);
             aether_atomic_store(&state->activeUDPSockets, udpCount);
         }
 
+        // Periodic heartbeat log every 10 seconds (100 polls * 100ms)
+        if ((pollCount++ % 100) == 0) {
+            AetherLogDaemon(@"[socket-monitor] pid %d: heartbeat — TCP=%u UDP=%u (total changes: TCP=%llu UDP=%llu)",
+                            targetPID, tcpCount, udpCount, totalTCPChanges, totalUDPChanges);
+        }
+
         usleep(100000);
     }
 
-    AetherLogDaemon(@"[socket-monitor] thread exiting — total TCP changes=%llu, UDP changes=%llu",
-                    totalTCPChanges, totalUDPChanges);
+    aether_atomic_store(&gSocketMonitorActivePID, 0);
+    AetherLogDaemon(@"[socket-monitor] thread EXITED for pid %d — total TCP changes=%llu, UDP changes=%llu",
+                    targetPID, totalTCPChanges, totalUDPChanges);
     return NULL;
 }
 
 /// Spawn a socket telemetry monitor thread for root-engine-only mode.
+/// Prevents duplicate threads for the same PID.
 extern "C" void AetherStartBPFCaptureIfAvailable(void) {
     AetherSharedState *state = AetherGetSharedState();
     if (!state) return;
@@ -296,12 +307,22 @@ extern "C" void AetherStartBPFCaptureIfAvailable(void) {
     pid_t targetPID = aether_atomic_load(&state->targetPID);
     if (targetPID <= 0) return;
 
+    // Prevent duplicate threads for same PID
+    pid_t current = aether_atomic_load(&gSocketMonitorActivePID);
+    if (current == targetPID) {
+        AetherLogDaemon(@"[socket-monitor] thread already running for pid %d, skipping", targetPID);
+        return;
+    }
+
     pthread_t thr;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&thr, &attr, AetherSocketTelemetryThread, (void *)(intptr_t)targetPID) == 0) {
-        AetherLogDaemon(@"[socket-monitor] telemetry thread spawned for pid %d", targetPID);
+        aether_atomic_store(&gSocketMonitorActivePID, targetPID);
+        AetherLogDaemon(@"[socket-monitor] telemetry thread SPAWNED for pid %d", targetPID);
+    } else {
+        AetherLogDaemon(@"[socket-monitor] thread spawn FAILED for pid %d (errno=%d)", targetPID, errno);
     }
     pthread_attr_destroy(&attr);
 }

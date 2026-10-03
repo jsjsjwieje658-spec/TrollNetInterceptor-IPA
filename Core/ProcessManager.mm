@@ -481,11 +481,13 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
                 if (rc2 == 0) {
                     aether_atomic_store(&state->isInjected, true);
                     aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1);
+                    AetherLog(@"LIVE attach SUCCESS — payload should announce '[hook] payload armed in target' in merged log");
                 } else if (method == 0) {
                     // Tier 2: Root PF/Socket engine fallback (only when no prior method)
                     AetherApplyRootTrafficControl(targetPID, state);
                     aether_atomic_store(&state->isInjected, true);
                     aether_atomic_store(&state->injectionMethod, 2);
+                    AetherLog(@"LIVE attach FAILED — falling back to Root PF engine (no packet capture, shaping only)");
                 }
             }
         }
