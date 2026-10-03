@@ -2,22 +2,8 @@
 //  NECPCapture.mm
 //  AetherNet — Tier 0: NECP (Network Extension Control Plane) Kernel Packet Filter
 //
-//  NECP is the modern iOS/macOS kernel API for network packet filtering.
-//  It allows matching packets by process UUID, direction, protocol, ports
-//  and diverting copies to a userspace socket for inspection — all WITHOUT
-//  requiring task_for_pid or Mach injection.
-//
-//  Requires entitlements (already in entitlements.plist):
-//    com.apple.private.necp.match
-//    com.apple.private.necp.policies
-//    com.apple.private.network.socket-delegate
-//
-//  Architecture:
-//  1. Create NECP client via necp_open()
-//  2. Create UDP socket for diverted packets
-//  3. Register NEFilterControlUnit with process UUID match
-//  4. Start background thread reading from divert socket
-//  5. Parse IP/TCP/UDP headers, push to shared memory for Log tab
+//  NECP functions are NOT in the flat namespace on iOS — they live in Network.framework
+//  Must resolve via dlsym at runtime from the Network framework.
 
 #import "NECPCapture.h"
 #import "AetherLog.h"
@@ -34,15 +20,16 @@
 #include <unistd.h>
 #include <errno.h>
 #include <uuid/uuid.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 
-// NECP SPI (private but stable across iOS 12+)
-extern "C" {
-    int necp_open(int flags);
-    int necp_client_action(int client_id, uint32_t action, void *parameters, size_t parameters_size);
-    int necp_match_policy(int client_id, uint32_t *policy_id, void *parameters, size_t parameters_size);
-    void necp_close(int client_id);
-}
+// NECP function pointers (resolved at runtime)
+static int (*g_necp_open)(int) = NULL;
+static int (*g_necp_close)(int) = NULL;
+static int (*g_necp_client_action)(int, uint32_t, void *, size_t) = NULL;
+static int (*g_necp_match_policy)(int, uint32_t *, void *, size_t) = NULL;
+
+static void *g_networkFrameworkHandle = NULL;
 
 // NECP action codes
 #define NECP_CLIENT_ACTION_REGISTER   1
@@ -94,6 +81,39 @@ static pthread_t gNECPThread = 0;
 static BOOL gNECPThreadRunning = NO;
 static pid_t gNECPTargetPID = 0;
 
+// Resolve NECP symbols from Network.framework at runtime
+static BOOL AetherNECPResolveSymbols(void) {
+    if (g_networkFrameworkHandle) return YES;
+    
+    // Try multiple possible locations
+    const char *paths[] = {
+        "/System/Library/Frameworks/Network.framework/Network",
+        "/usr/lib/libnetwork.dylib",
+        "/System/Library/PrivateFrameworks/NetworkExtension.framework/NetworkExtension",
+        NULL
+    };
+    
+    for (int i = 0; paths[i]; i++) {
+        void *handle = dlopen(paths[i], RTLD_LAZY | RTLD_LOCAL);
+        if (handle) {
+            g_necp_open = dlsym(handle, "necp_open");
+            g_necp_close = dlsym(handle, "necp_close");
+            g_necp_client_action = dlsym(handle, "necp_client_action");
+            g_necp_match_policy = dlsym(handle, "necp_match_policy");
+            
+            if (g_necp_open && g_necp_close && g_necp_client_action && g_necp_match_policy) {
+                g_networkFrameworkHandle = handle;
+                AetherLogDaemon(@"[necp] Resolved symbols from %s", paths[i]);
+                return YES;
+            }
+            dlclose(handle);
+        }
+    }
+    
+    AetherLogDaemon(@"[necp] Failed to resolve NECP symbols from any framework");
+    return NO;
+}
+
 static void *AetherNECPWorkerThread(void *arg) {
     AetherLogDaemon(@"[necp] worker thread started");
     
@@ -141,7 +161,7 @@ static void *AetherNECPWorkerThread(void *arg) {
         AetherLogDaemon(@"[necp] CAPTURE %s %s:%u -> %s:%u len=%zd",
                         protoStr, srcIP, srcPort, dstIP, dstPort, len);
         
-        // Update shared memory counters (use atomic load/store instead of fetch_add)
+        // Update shared memory counters
         AetherSharedState *state = AetherGetSharedState();
         if (state) {
             if (proto == IPPROTO_TCP) {
@@ -195,7 +215,7 @@ static BOOL AetherNECPGetProcessUUID(pid_t pid, uuid_t outUUID) {
         uint64_t pbi_ixrss;
         uint64_t pbi_idrss;
         uint64_t pbi_isrss;
-        uuid_t   pbi_uuid;  // <-- this is what we need
+        uuid_t   pbi_uuid;
     };
     
     struct proc_bsdinfo bsdInfo;
@@ -221,23 +241,30 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
         return -2;
     }
     
+    // Resolve NECP symbols at runtime
+    if (!AetherNECPResolveSymbols()) {
+        snprintf(errBuf, errBufLen, "NECP symbols not available on this iOS version");
+        AetherLogDaemon(@"[necp] NECP symbols not available");
+        return -3;
+    }
+    
     AetherLogDaemon(@"[necp] starting capture for pid %d", pid);
     
     // 1. Open NECP client
-    gNECPClientId = necp_open(0);
+    gNECPClientId = g_necp_open(0);
     if (gNECPClientId < 0) {
         snprintf(errBuf, errBufLen, "necp_open failed: %d", errno);
         AetherLogDaemon(@"[necp] necp_open failed: %d", errno);
-        return -3;
+        return -4;
     }
     
     // 2. Create UDP socket for diverted packets
     gNECPDivertSocket = socket(AF_INET, SOCK_DGRAM, 0);
     if (gNECPDivertSocket < 0) {
         snprintf(errBuf, errBufLen, "divert socket failed: %d", errno);
-        necp_close(gNECPClientId);
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
-        return -4;
+        return -5;
     }
     
     // Bind to localhost ephemeral port
@@ -249,9 +276,9 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
         snprintf(errBuf, errBufLen, "divert bind failed: %d", errno);
         close(gNECPDivertSocket);
         gNECPDivertSocket = -1;
-        necp_close(gNECPClientId);
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
-        return -5;
+        return -6;
     }
     
     // Get the bound port
@@ -264,13 +291,13 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
     fdData.fd = gNECPDivertSocket;
     fdData.flags = 0;
     
-    if (necp_client_action(gNECPClientId, NECP_CLIENT_ACTION_REGISTER, &fdData, sizeof(fdData)) != 0) {
+    if (g_necp_client_action(gNECPClientId, NECP_CLIENT_ACTION_REGISTER, &fdData, sizeof(fdData)) != 0) {
         snprintf(errBuf, errBufLen, "necp_client_action REGISTER failed: %d", errno);
         close(gNECPDivertSocket);
         gNECPDivertSocket = -1;
-        necp_close(gNECPClientId);
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
-        return -6;
+        return -7;
     }
     
     // 4. Build policy parameters matching target process UUID
@@ -282,7 +309,7 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
     void *params = calloc(1, paramSize);
     if (!params) {
         snprintf(errBuf, errBufLen, "calloc failed");
-        return -7;
+        return -8;
     }
     
     // Build parameter chain: process UUID + divert action
@@ -308,14 +335,14 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
     ((struct necp_policy_parameter *)params)->length = offset;
     
     // 5. Match policy
-    if (necp_match_policy(gNECPClientId, &gNECPPolicyId, params, offset) != 0) {
+    if (g_necp_match_policy(gNECPClientId, &gNECPPolicyId, params, offset) != 0) {
         snprintf(errBuf, errBufLen, "necp_match_policy failed: %d", errno);
         free(params);
         close(gNECPDivertSocket);
         gNECPDivertSocket = -1;
-        necp_close(gNECPClientId);
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
-        return -8;
+        return -9;
     }
     
     free(params);
@@ -328,9 +355,9 @@ extern "C" int AetherNECPStartCapture(pid_t pid, char *errBuf, size_t errBufLen)
         gNECPThreadRunning = NO;
         close(gNECPDivertSocket);
         gNECPDivertSocket = -1;
-        necp_close(gNECPClientId);
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
-        return -9;
+        return -10;
     }
     
     AetherLogDaemon(@"[necp] capture STARTED for pid %d (divert port %u, policy %u)", pid, divertPort, gNECPPolicyId);
@@ -348,9 +375,9 @@ extern "C" void AetherNECPStopCapture(void) {
         gNECPThread = 0;
     }
     
-    if (gNECPPolicyId != 0 && gNECPClientId >= 0) {
+    if (gNECPPolicyId != 0 && gNECPClientId >= 0 && g_necp_client_action) {
         // Unmatch policy (action = unregister)
-        necp_client_action(gNECPClientId, NECP_CLIENT_ACTION_UNREGISTER, &gNECPPolicyId, sizeof(gNECPPolicyId));
+        g_necp_client_action(gNECPClientId, NECP_CLIENT_ACTION_UNREGISTER, &gNECPPolicyId, sizeof(gNECPPolicyId));
         gNECPPolicyId = 0;
     }
     
@@ -359,8 +386,8 @@ extern "C" void AetherNECPStopCapture(void) {
         gNECPDivertSocket = -1;
     }
     
-    if (gNECPClientId >= 0) {
-        necp_close(gNECPClientId);
+    if (gNECPClientId >= 0 && g_necp_close) {
+        g_necp_close(gNECPClientId);
         gNECPClientId = -1;
     }
     
