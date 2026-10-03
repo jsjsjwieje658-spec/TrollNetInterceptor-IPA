@@ -60,18 +60,17 @@
 
 #import "../Core/AetherLog.h"
 
-#pragma mark - Hook payload installer (roothide TweakInject)
+//
+//  HUDMain.mm — Minimal Hook Payload Installer (Tier 1 fallback only)
+//  NECP (Tier 0) requires NO injection. This only stages dylib for Mach injection fallback.
+//
+#pragma mark - Minimal Hook Payload Installer (Tier 1 fallback only)
 
-// Installs libNetHookPayload.dylib as a roothide tweak so ellekit injects it
-// into every UIKit process at launch; the payload self-gates to the attached
-// target (pid or bundle-id match). This replaces remote dlopen (blocked by
-// PPL/PAC) as the real L4 capture delivery path.
-// Try to copy src->dst with the current process. Returns 0 on success.
 static int AetherTryCopy(NSString *src, NSString *dst)
 {
     NSData *data = [NSData dataWithContentsOfFile:src];
     if (!data) return -1;
-    unlink(dst.fileSystemRepresentation); // clear immutable/leftover first
+    unlink(dst.fileSystemRepresentation);
     int fd = open(dst.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) return -2;
     const char *bytes = (const char *)[data bytes];
@@ -83,82 +82,7 @@ static int AetherTryCopy(NSString *src, NSString *dst)
     }
     close(fd);
     chmod(dst.fileSystemRepresentation, 0755);
-    return (remaining == 0) ? 0 : -3;
-}
-
-// Copy by EXECUTING a helper binary that lives INSIDE the jbroot. roothide
-// trusts jbroot-resident executables, so its TweakInject write-protection
-// (which gives uid-0 processes EPERM) can be bypassed by cp/mv/dd/install.
-static int AetherCopyViaJbrootHelper(NSString *jbroot, NSString *src, NSString *dst)
-{
-    NSArray *candidates = @[@"cp", @"mv", @"install", @"dd"];
-    NSString *found = nil;
-    for (NSString *name in candidates) {
-        NSString *p = [jbroot stringByAppendingPathComponent:
-                       [@"usr/bin/" stringByAppendingString:name]];
-        if ([[NSFileManager defaultManager] isExecutableFileAtPath:p]) { found = p; break; }
-    }
-    if (!found) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) return -2;
-    if (pid == 0) {
-        // child — jbroot-resident helper, inherits root
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
-        if ([found hasSuffix:@"dd"]) {
-            execl(found.fileSystemRepresentation, found.fileSystemRepresentation,
-                  [NSString stringWithFormat:@"if=%@", src].UTF8String,
-                  [NSString stringWithFormat:@"of=%@", dst].UTF8String, (char *)NULL);
-        } else {
-            execl(found.fileSystemRepresentation, found.fileSystemRepresentation,
-                  src.fileSystemRepresentation, dst.fileSystemRepresentation, (char *)NULL);
-        }
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -3;
     return 0;
-}
-
-// fork+exec a helper binary that lives INSIDE the jbroot (trusted context)
-static int AetherExecJbrootBinary2(NSString *jbroot, NSString *relPath, NSString *arg1, NSString *arg2)
-{
-    NSString *tool = [jbroot stringByAppendingPathComponent:relPath];
-    if ([[NSFileManager defaultManager] isExecutableFileAtPath:tool] == NO) return -100;
-    pid_t pid = fork();
-    if (pid < 0) return -101;
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
-        execl(tool.fileSystemRepresentation, tool.fileSystemRepresentation,
-              arg1.fileSystemRepresentation, arg2.fileSystemRepresentation, (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status)) return -102;
-    return WEXITSTATUS(status);
-}
-
-static int AetherExecJbrootBinary(NSString *jbroot, NSString *relPath, NSString *arg1)
-{
-    NSString *tool = [jbroot stringByAppendingPathComponent:relPath];
-    if ([[NSFileManager defaultManager] isExecutableFileAtPath:tool] == NO) return -100;
-    pid_t pid = fork();
-    if (pid < 0) return -101;
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
-        execl(tool.fileSystemRepresentation, tool.fileSystemRepresentation,
-              arg1.fileSystemRepresentation, (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status)) return -102;
-    return WEXITSTATUS(status);
 }
 
 static void AetherInstallHookPayload(void)
@@ -176,188 +100,29 @@ static void AetherInstallHookPayload(void)
             AetherLog(@"[installer] payload missing at %@", srcDylib);
             return;
         }
-        unsigned long long srcSize = [[fm attributesOfItemAtPath:srcDylib error:nil] fileSize];
 
-        // ── Discover the roothide jbroot (hidden .jbroot-<hash> dir) ──
-        DIR *d = opendir("/private/var/containers/Bundle/Application");
-        if (!d) {
-            AetherLog(@"[installer] cannot open Bundle/Application (errno=%d)", errno);
-            return;
-        }
-        NSString *jbroot = nil;
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (strncmp(ent->d_name, ".jbroot-", 8) == 0) {
-                jbroot = [NSString stringWithFormat:@"/private/var/containers/Bundle/Application/%s",
-                          ent->d_name];
-                break;
-            }
-        }
-        closedir(d);
-        if (!jbroot) {
-            AetherLog(@"[installer] no .jbroot-* dir found (not roothide?)");
-            return;
-        }
-
-        // ── AMFI fix (roothide-style, learned from its source): re-sign the
-        // payload with jbroot/basebin/fastPathSign (coretrust bug) so STOCK
-        // AMFI accepts it inside any process — no trustcache needed. Our
-        // ldid-adhoc signature would be rejected by normal apps. ──
-        NSString *workCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
-        [fm removeItemAtPath:workCopy error:nil];
-        BOOL copied = [fm copyItemAtPath:srcDylib toPath:workCopy error:nil];
-        if (!copied) {
+        // ── Stage signed dylib to world-readable cache for Mach injection (Tier 1) ──
+        // NECP (Tier 0) requires NO injection at all. This is ONLY for fallback.
+        NSString *cacheDylib = @"/var/mobile/Library/Caches/libNetHookPayload.dylib";
+        [fm removeItemAtPath:cacheDylib error:nil];
+        BOOL ok = [fm copyItemAtPath:srcDylib toPath:cacheDylib error:nil];
+        if (!ok) {
             NSData *raw = [NSData dataWithContentsOfFile:srcDylib];
-            copied = [raw writeToFile:workCopy atomically:YES];
+            ok = [raw writeToFile:cacheDylib atomically:YES];
         }
-        if (!copied) {
-            AetherLog(@"[installer] cannot create working copy at %@", workCopy);
-            return;
-        }
-        // Discovery: log what basebin actually contains (3.5.0 guessed the
-        // path and got rc=-100). Probe several candidates, then sign.
-        {
-            DIR *bd = opendir([jbroot stringByAppendingPathComponent:@"basebin"].fileSystemRepresentation);
-            if (bd) {
-                NSMutableString *listing = [NSMutableString string];
-                struct dirent *bent;
-                int shown = 0;
-                while ((bent = readdir(bd)) != NULL && shown < 15) {
-                    [listing appendFormat:@"%s ", bent->d_name]; shown++;
-                }
-                closedir(bd);
-                AetherLog(@"[installer] jbroot/basebin contents: %@", listing);
-            } else {
-                AetherLog(@"[installer] jbroot/basebin not listable (errno=%d)", errno);
-            }
-        }
-        int signRc = -100;
-        for (NSString *cand in @[@"basebin/fastPathSign", @"usr/bin/fastPathSign",
-                                 @"basebin/ldid", @"usr/bin/ldid"]) {
-            NSString *full = [jbroot stringByAppendingPathComponent:cand];
-            if ([fm isExecutableFileAtPath:full]) {
-                if ([cand hasSuffix:@"ldid"]) {
-                    // ldid needs -S + path → use the generic exec helper with args
-                    signRc = AetherExecJbrootBinary2(jbroot, cand, @"-S", workCopy);
-                } else {
-                    signRc = AetherExecJbrootBinary(jbroot, cand, workCopy);
-                }
-                AetherLog(@"[installer] signer %@ rc=%d", cand, signRc);
-                if (signRc == 0) break;
-            }
-        }
-        unsigned long long signedSize = [[fm attributesOfItemAtPath:workCopy error:nil] fileSize];
-        if (signRc == 0 && signedSize > 0) {
-            chmod(workCopy.fileSystemRepresentation, 0755);
-            // Publish for the app's live-attach path
-            [fm removeItemAtPath:@"/var/mobile/Library/Caches/libNetHookPayload.dylib" error:nil];
-            [fm copyItemAtPath:workCopy
-                        toPath:@"/var/mobile/Library/Caches/libNetHookPayload.dylib" error:nil];
-            chmod("/var/mobile/Library/Caches/libNetHookPayload.dylib", 0755);
-            AetherLog(@"[installer] fastPathSign OK (%llu -> %llu bytes, coretrust signature published)",
-                      srcSize, signedSize);
+        if (ok) {
+            chmod(cacheDylib.fileSystemRepresentation, 0755);
+            AetherLog(@"[installer] staged dylib for Mach fallback -> %@ (%llu bytes)",
+                      cacheDylib, (unsigned long long)[[fm attributesOfItemAtPath:cacheDylib error:nil] fileSize]);
         } else {
-            AetherLog(@"[installer] fastPathSign rc=%d size=%llu — continuing with adhoc signature "
-                      @"(Dopamine PPL bypass handles AMFI on live-attach path)",
-                      signRc, signedSize);
+            AetherLog(@"[installer] failed to stage dylib to cache");
         }
-        NSString *payloadDylib = workCopy; // install the (re)signed copy
-        unsigned long long payloadSize = signedSize ?: srcSize;
-
-        // ── Tweak-loader gate: bootstrap.c only loads tweaks when this
-        // marker exists — create it if a previous tweak install removed it. ──
-        if ([fm fileExistsAtPath:@"/var/mobile/.tweakenabled"] == NO) {
-            [@"" writeToFile:@"/var/mobile/.tweakenabled" atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            AetherLog(@"[installer] created /var/mobile/.tweakenabled (tweak gate marker)");
-        }
-
-        NSString *plist =
-            @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-            @"<plist version=\"1.0\">\n"
-            @"<dict>\n"
-            @"  <key>Filter</key>\n"
-            @"  <dict>\n"
-            @"    <key>Bundles</key>\n"
-            @"    <array>\n"
-            @"      <string>com.apple.UIKit</string>\n"
-            @"    </array>\n"
-            @"  </dict>\n"
-            @"</dict>\n"
-            @"</plist>\n";
-        NSString *tmpPlist = @"/var/mobile/Library/aethernet-filter.plist";
-        [plist writeToFile:tmpPlist atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        // ── Candidate tweak dirs: direct jbroot + /var/jb alias ──
-        NSMutableArray *tweakDirs = [NSMutableArray array];
-        [tweakDirs addObject:[jbroot stringByAppendingPathComponent:@"usr/lib/TweakInject"]];
-        struct stat sb;
-        if (lstat("/var/jb", &sb) == 0 && S_ISLNK(sb.st_mode)) {
-            [tweakDirs addObject:@"/var/jb/usr/lib/TweakInject"];
-        }
-
-        for (NSString *tweakDir in tweakDirs) {
-            BOOL isDir = NO;
-            if (![fm fileExistsAtPath:tweakDir isDirectory:&isDir] || !isDir) {
-                AetherLog(@"[installer] TweakInject missing at %@", tweakDir);
-                continue;
-            }
-            NSString *dstDylib = [tweakDir stringByAppendingPathComponent:@"AetherNetHook.dylib"];
-            NSString *dstPlist = [tweakDir stringByAppendingPathComponent:@"AetherNetHook.plist"];
-
-            // Attempt 1: direct write (works only for jbroot-resident writers)
-            int rc = AetherTryCopy(payloadDylib, dstDylib);
-            if (rc == 0) rc = AetherTryCopy(tmpPlist, dstPlist);
-            if (rc == 0) {
-                chmod(dstDylib.fileSystemRepresentation, 0755);
-                chmod(dstPlist.fileSystemRepresentation, 0644);
-                AetherLog(@"[installer] payload INSTALLED (direct write) -> %@ — respring the device", dstDylib);
-                return;
-            }
-            AetherLog(@"[installer] direct write failed rc=%d errno=%d — trying jbroot helper", rc, errno);
-
-            // Attempt 2: exec jbroot-resident cp/mv/install/dd (trusted writers)
-            NSArray *helpers = @[@"cp", @"mv", @"install", @"dd"];
-            NSString *helper = nil;
-            for (NSString *h in helpers) {
-                NSString *p = [jbroot stringByAppendingPathComponent:
-                               [@"usr/bin/" stringByAppendingString:h]];
-                if ([fm isExecutableFileAtPath:p]) { helper = p; break; }
-            }
-            if (helper) {
-                AetherLog(@"[installer] using jbroot helper %@", helper.lastPathComponent);
-                if (AetherCopyViaJbrootHelper(jbroot, payloadDylib, dstDylib) == 0 &&
-                    AetherCopyViaJbrootHelper(jbroot, tmpPlist, dstPlist) == 0) {
-                    NSDictionary *a1 = [fm attributesOfItemAtPath:dstDylib error:nil];
-                    if ([a1 fileSize] == payloadSize) {
-                        chmod(dstDylib.fileSystemRepresentation, 0755);
-                        chmod(dstPlist.fileSystemRepresentation, 0644);
-                        AetherLog(@"[installer] payload INSTALLED (jbroot helper) -> %@ — respring the device", dstDylib);
-                        return;
-                    }
-                }
-            } else {
-                AetherLog(@"[installer] no cp/mv/install/dd inside jbroot");
-            }
-            AetherLog(@"[installer] jbroot-helper copy failed (errno=%d)", errno);
-        }
-
-        // ── All automatic strategies failed → export the SIGNED payload ──
-        NSString *exportDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-                               stringByAppendingPathComponent:@"AetherNetHook-install"];
-        [fm createDirectoryAtPath:exportDir withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *expDylib = [exportDir stringByAppendingPathComponent:@"AetherNetHook.dylib"];
-        NSString *expPlist = [exportDir stringByAppendingPathComponent:@"AetherNetHook.plist"];
-        [fm removeItemAtPath:expDylib error:nil];
-        BOOL ok = [fm copyItemAtPath:payloadDylib toPath:expDylib error:nil];
-        [plist writeToFile:expPlist atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        AetherLog(@"[installer] AUTO INSTALL BLOCKED (roothide jbroot write protection) — exported SIGNED payload to Documents/AetherNetHook-install/ ok=%d", ok);
-        AetherLog(@"[installer] MANUAL (Filza): copy BOTH files into %@ then RESPRING", [tweakDirs firstObject]);
     }
     @catch (NSException *ex) {
         AetherLog(@"[installer] exception: %@", ex.reason);
     }
 }
+
 
 #pragma mark - Raw digitizer touch path (primary — no AXEventRepresentation needed)
 
