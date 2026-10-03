@@ -216,10 +216,11 @@ static void *AetherSocketTelemetryThread(void *arg) {
     // active and no hook payload is injected.
     while (state && aether_atomic_load(&gSocketMonitorActivePID) == targetPID) {
         uint8_t currentMethod = aether_atomic_load(&state->injectionMethod);
-        if (currentMethod == 1 || currentMethod == 3) {
-            AetherLogDaemon(@"[socket-monitor] dylib hooks available (method=%u) — stopping monitor", currentMethod);
+        if (currentMethod == 1) {  // Only Mach dylib hooks = full packet capture (method 1)
+            AetherLogDaemon(@"[socket-monitor] Mach hooks active (method=%u) — stopping monitor", currentMethod);
             break;
         }
+        // method 0=NECP only, 2=NECP only, 3=Root PF only, 4=NECP+PF → no dylib hooks, keep monitoring
 
         pid_t currentPID = aether_atomic_load(&state->targetPID);
         bool interception = aether_atomic_load(&state->interceptionActive);

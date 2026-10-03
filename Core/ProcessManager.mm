@@ -470,26 +470,35 @@ extern "C" BOOL AetherNECPIsRunning(void);
                 chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
             }
 
-            // Try NECP first (Tier 0) — no injection needed, works on all TrollStore devices
-            if (aether_atomic_load(&state->injectionMethod) == 0) {
-                [self startNECPCaptureForPID:targetPID error:nil];
+            // ALWAYS try NECP first (Tier 0) — no injection needed, works on all TrollStore devices
+            // NECP captures at kernel level, independent of Mach injection
+            BOOL necpStarted = [self startNECPCaptureForPID:targetPID error:nil];
+            if (necpStarted) {
+                AetherLog(@"NECP Tier 0 STARTED — kernel-level packet capture active");
+            } else {
+                AetherLog(@"NECP unavailable — will rely on injection fallback");
             }
 
             // Then try Mach injection (Tier 1) for full packet detail
-            uint8_t method = aether_atomic_load(&state->injectionMethod);
-            if (method == 0 || method == 3) {  // NECP running or only PF fallback
-                char errBuf2[256] = {0};
-                int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
-                AetherLog(@"LIVE Mach attach pid %d rc=%d err=[%s]", targetPID, rc2, errBuf2);
-                if (rc2 == 0) {
-                    aether_atomic_store(&state->isInjected, true);
-                    aether_atomic_store(&state->injectionMethod, 1);
-                    AetherLog(@"Mach hooks ACTIVE — full packet capture enabled");
-                } else if (method == 0) {
-                    // NECP running but Mach failed — keep NECP, add PF for shaping
+            char errBuf2[256] = {0};
+            int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
+            AetherLog(@"LIVE Mach attach pid %d rc=%d err=[%s]", targetPID, rc2, errBuf2);
+            if (rc2 == 0) {
+                aether_atomic_store(&state->isInjected, true);
+                aether_atomic_store(&state->injectionMethod, 1);
+                AetherLog(@"Mach hooks ACTIVE — full packet capture enabled");
+            } else {
+                // Mach failed — NECP running or NECP unavailable
+                if (necpStarted) {
+                    // NECP works, add PF for shaping
                     AetherApplyRootTrafficControl(targetPID, state);
                     aether_atomic_store(&state->injectionMethod, 4); // NECP + PF
-                    AetherLog(@"Mach failed — NECP + Root PF active");
+                    AetherLog(@"Mach failed — NECP + Root PF active (method=4)");
+                } else {
+                    // NECP failed, only PF fallback
+                    AetherApplyRootTrafficControl(targetPID, state);
+                    aether_atomic_store(&state->injectionMethod, 3); // Root PF only
+                    AetherLog(@"NECP + Mach failed — Root PF only (method=3)");
                 }
             }
         }
@@ -497,15 +506,9 @@ extern "C" BOOL AetherNECPIsRunning(void);
 
     if (wasActive && !active) {
         notify_post(kAetherNotifyFlushQueue);
+        [self stopNECPCapture];
     } else if (!wasActive && active) {
         notify_post(kAetherNotifyConfigChanged);
-    }
-
-    pid_t targetPID = aether_atomic_load(&state->targetPID);
-    uint8_t method = aether_atomic_load(&state->injectionMethod);
-    if (targetPID > 0 && method == 3) {
-        AetherApplyRootTrafficControl(targetPID, state);
-        AetherStartBPFCaptureIfAvailable();
     }
 
     notify_post(kAetherNotifyStateChanged);
