@@ -96,10 +96,10 @@ static BOOL AetherNECPResolveSymbols(void) {
     for (int i = 0; paths[i]; i++) {
         void *handle = dlopen(paths[i], RTLD_LAZY | RTLD_LOCAL);
         if (handle) {
-            g_necp_open = dlsym(handle, "necp_open");
-            g_necp_close = dlsym(handle, "necp_close");
-            g_necp_client_action = dlsym(handle, "necp_client_action");
-            g_necp_match_policy = dlsym(handle, "necp_match_policy");
+            g_necp_open = (int(*)(int))dlsym(handle, "necp_open");
+            g_necp_close = (int(*)(int))dlsym(handle, "necp_close");
+            g_necp_client_action = (int(*)(int, uint32_t, void*, size_t))dlsym(handle, "necp_client_action");
+            g_necp_match_policy = (int(*)(int, uint32_t*, void*, size_t))dlsym(handle, "necp_match_policy");
             
             if (g_necp_open && g_necp_close && g_necp_client_action && g_necp_match_policy) {
                 g_networkFrameworkHandle = handle;
