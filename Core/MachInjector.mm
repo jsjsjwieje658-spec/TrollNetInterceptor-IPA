@@ -19,7 +19,38 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <libproc.h>
+
+// libproc.h is not in iOS SDK — manually declare proc_pidinfo interface
+// (from XNU libproc/proc_info.h)
+#define PROC_PIDLISTSOCKETS   5
+#define PROC_PIDFDSOCKETINFO  6
+#define PROC_PIDTASKALLINFO   7
+#define S_IFSOCK 0xC000
+#define PROC_SOCKET_FD_LISTEN 0x01
+
+struct proc_bsdinfo {
+    uint32_t pbi_fd;
+    uint32_t pbi_kind;
+    // ... other fields
+};
+
+struct socket_fdinfo {
+    uint32_t pinfo;
+    struct so_info soi;
+};
+
+struct so_info {
+    uint32_t soi_kind;
+    uint32_t soi_type;
+    uint32_t soi_family;
+    uint32_t soi_protocol;
+    uint32_t soi_state;
+    uint64_t soi_rcv;
+    uint64_t soi_snd;
+};
+
+extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
