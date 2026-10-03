@@ -567,8 +567,7 @@
 
     // Update HUD button
     BOOL hudRunning = [[AetherProcessManager sharedManager] isGlobalFloatingHUDRunning];
-    [self.spawnHUDButton.buttonLabel setText:hudRunning ? @"−  Remove Floating Button" : @"+  Create Floating Button"
-                            forState:UIControlStateNormal];
+    self.spawnHUDButton.buttonLabel.text = hudRunning ? @"−  Remove Floating Button" : @"+  Create Floating Button";
 
     // Status label
     NSString *methodStr = (method == 1) ? @"Mach dylib hooks" :
