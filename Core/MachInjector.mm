@@ -210,7 +210,11 @@ static void *AetherSocketTelemetryThread(void *arg) {
     uint64_t totalTCPChanges = 0, totalUDPChanges = 0;
     uint64_t pollCount = 0;
 
-    while (state && aether_atomic_load(&state->hudVisible) && aether_atomic_load(&gSocketMonitorActivePID) == targetPID) {
+    // Run while: shared state valid + no dylib hooks + this thread owns the PID
+    // Don't depend on hudVisible (HUD UI visibility) — socket monitor is a
+    // background telemetry fallback that should run whenever interception is
+    // active and no hook payload is injected.
+    while (state && aether_atomic_load(&gSocketMonitorActivePID) == targetPID) {
         uint8_t currentMethod = aether_atomic_load(&state->injectionMethod);
         if (currentMethod == 1 || currentMethod == 3) {
             AetherLogDaemon(@"[socket-monitor] dylib hooks available (method=%u) — stopping monitor", currentMethod);
