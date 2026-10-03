@@ -230,7 +230,7 @@
         placeholder.font = [AppTheme displayFont:20];
         placeholder.textAlignment = NSTextAlignmentCenter;
         placeholder.textColor = [AppTheme colorGold];
-        placeholder.backgroundColor = [AppTheme colorSurface];
+        placeholder.backgroundColor = [AppTheme colorElevated];
         [iconHost.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
         [iconHost addSubview:placeholder];
     }
@@ -244,7 +244,7 @@
         socketBadge.textColor = [AppTheme colorGold];
     } else {
         socketBadge.text = @"no sockets";
-        socketBadge.textColor = [AppTheme colorTextMuted];
+        socketBadge.textColor = [AppTheme colorTextSecondary];
     }
 
     return cell;
@@ -262,9 +262,10 @@
 
 @interface HomeViewController ()
 @property (nonatomic, strong) UIButton *targetBox;
-@property (nonatomic, strong) UIButton *interceptButton;
-@property (nonatomic, strong) UIButton *spawnHUDButton;
+@property (nonatomic, strong) AetherGoldButton *interceptButton;
+@property (nonatomic, strong) AetherGoldButton *spawnHUDButton;
 @property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UILabel *brandLabel;
 @end
 
 @implementation HomeViewController {
@@ -318,27 +319,27 @@
 }
 
 - (void)setupBrandHeader {
-    UILabel *brand = [AppTheme titleLabelWithText:@"AetherNet"];
-    brand.font = [AppTheme displayFont:28];
-    brand.textAlignment = NSTextAlignmentCenter;
+    self.brandLabel = [AppTheme titleLabelWithText:@"AetherNet"];
+    self.brandLabel.font = [AppTheme displayFont:28];
+    self.brandLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [AppTheme valueLabelWithText:@"TCP/UDP Packet Interception" mono:NO];
     subtitle.textAlignment = NSTextAlignmentCenter;
 
-    [_contentView addSubview:brand];
+    [_contentView addSubview:self.brandLabel];
     [_contentView addSubview:subtitle];
 
-    brand.translatesAutoresizingMaskIntoConstraints = NO;
+    self.brandLabel.translatesAutoresizingMaskIntoConstraints = NO;
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
 
     [NSLayoutConstraint activateConstraints:@[
-        [brand.topAnchor constraintEqualToAnchor:_contentView.topAnchor constant:24],
-        [brand.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:24],
-        [brand.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-24],
+        [self.brandLabel.topAnchor constraintEqualToAnchor:_contentView.topAnchor constant:24],
+        [self.brandLabel.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:24],
+        [self.brandLabel.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-24],
 
-        [subtitle.topAnchor constraintEqualToAnchor:brand.bottomAnchor constant:4],
-        [subtitle.leadingAnchor constraintEqualToAnchor:brand.leadingAnchor],
-        [subtitle.trailingAnchor constraintEqualToAnchor:brand.trailingAnchor],
+        [subtitle.topAnchor constraintEqualToAnchor:self.brandLabel.bottomAnchor constant:4],
+        [subtitle.leadingAnchor constraintEqualToAnchor:self.brandLabel.leadingAnchor],
+        [subtitle.trailingAnchor constraintEqualToAnchor:self.brandLabel.trailingAnchor],
     ]];
 }
 
@@ -351,10 +352,10 @@
 
     self.targetBox = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.targetBox addTarget:self action:@selector(openProcessPicker) forControlEvents:UIControlEventTouchUpInside];
-    self.targetBox.backgroundColor = [AppTheme colorSurface];
+    self.targetBox.backgroundColor = [AppTheme colorElevated];
     self.targetBox.layer.cornerRadius = 14;
     self.targetBox.layer.borderWidth = 1;
-    self.targetBox.layer.borderColor = [AppTheme colorBorder].CGColor;
+    self.targetBox.layer.borderColor = [AppTheme colorCardBorder].CGColor;
     self.targetBox.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [card addSubview:self.targetBox];
 
@@ -379,7 +380,7 @@
     self.boxSubtitle.translatesAutoresizingMaskIntoConstraints = NO;
 
     [NSLayoutConstraint activateConstraints:@[
-        [card.topAnchor constraintEqualToAnchor:brand.bottomAnchor constant:24],
+        [card.topAnchor constraintEqualToAnchor:self.brandLabel.bottomAnchor constant:24],
         [card.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:16],
         [card.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-16],
 
@@ -414,7 +415,8 @@
     UILabel *header = [AppTheme titleLabelWithText:@"Interception"];
     [_contentView addSubview:header];
 
-    self.interceptButton = [AetherGoldButton buttonWithTitle:@"▶  Start Capture" target:self action:@selector(toggleInterception)];
+    self.interceptButton = [[AetherGoldButton alloc] initWithTitle:@"▶  Start Capture"];
+    [self.interceptButton addTarget:self action:@selector(toggleInterception) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:self.interceptButton];
 
     header.translatesAutoresizingMaskIntoConstraints = NO;
@@ -444,7 +446,9 @@
     UILabel *header = [AppTheme titleLabelWithText:@"Floating HUD Button"];
     [_contentView addSubview:header];
 
-    self.spawnHUDButton = [AetherGoldButton buttonWithTitle:@"+  Create Floating Button" target:self action:@selector(toggleHUD)];
+    self.spawnHUDButton = [[AetherGoldButton alloc] initWithTitle:@"+  Create Floating Button"];
+    [self.spawnHUDButton addTarget:self action:@selector(toggleHUD) forControlEvents:UIControlEventTouchUpInside];
+    [self.spawnHUDButton applySecondaryStyle];
     [card addSubview:self.spawnHUDButton];
 
     self.statusLabel = [AppTheme valueLabelWithText:@"" mono:NO];
@@ -530,7 +534,8 @@
 
     // Update target box
     if (targetPID > 0) {
-        AetherProcessInfo *info = [[AetherProcessManager sharedManager].enumerateRunningProcessesWithFilter:[NSString stringWithFormat:@"%d", targetPID] onlyUserApps:NO].firstObject;
+        NSArray *processes = [[AetherProcessManager sharedManager] enumerateRunningProcessesWithFilter:[NSString stringWithFormat:@"%d", targetPID] onlyUserApps:NO];
+        AetherProcessInfo *info = processes.firstObject;
         if (info) {
             self.boxTitle.text = info.displayName;
             self.boxSubtitle.text = [NSString stringWithFormat:@"PID %d  •  %@  •  TCP:%u UDP:%u",
@@ -553,16 +558,16 @@
 
     // Update intercept button
     if (active) {
-        [self.interceptButton setTitle:@"⏸  Stop Capture" forState:UIControlStateNormal];
-        self.interceptButton.backgroundColor = [AppTheme colorError];
+        [self.interceptButton.buttonLabel setText:@"⏸  Stop Capture"];
+        self.interceptButton.backgroundColor = [AppTheme colorWarnRed];
     } else {
-        [self.interceptButton setTitle:@"▶  Start Capture" forState:UIControlStateNormal];
+        [self.interceptButton.buttonLabel setText:@"▶  Start Capture"];
         self.interceptButton.backgroundColor = [AppTheme colorGold];
     }
 
     // Update HUD button
     BOOL hudRunning = [[AetherProcessManager sharedManager] isGlobalFloatingHUDRunning];
-    [self.spawnHUDButton setTitle:hudRunning ? @"−  Remove Floating Button" : @"+  Create Floating Button"
+    [self.spawnHUDButton.buttonLabel setText:hudRunning ? @"−  Remove Floating Button" : @"+  Create Floating Button"
                             forState:UIControlStateNormal];
 
     // Status label
