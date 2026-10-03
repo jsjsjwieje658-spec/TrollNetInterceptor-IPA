@@ -127,13 +127,12 @@ extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *
 extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state) {
     if (!state) return -1;
 
-    AetherTrafficMode mode = (AetherTrafficMode)aether_atomic_load(&state->trafficMode);
+    AetherInterceptMode mode = (AetherInterceptMode)aether_atomic_load(&state->interceptMode);
     uint32_t ratio = aether_atomic_load(&state->captureRatioPercent);
-    uint32_t delayMs = aether_atomic_load(&state->delayMs);
-    uint32_t jitterMs = aether_atomic_load(&state->jitterMs);
+    uint32_t delayMs = aether_atomic_load(&state->simulatedLatencyMs);
     uint32_t bwLimitKbps = aether_atomic_load(&state->bandwidthLimitKbps);
-    AetherDirection direction = (AetherDirection)aether_atomic_load(&state->directionFilter);
-    AetherProtocol protoFilter = (AetherProtocol)aether_atomic_load(&state->protocolFilter);
+    AetherTrafficDirection direction = (AetherTrafficDirection)aether_atomic_load(&state->direction);
+    AetherProtocolFilter protoFilter = (AetherProtocolFilter)aether_atomic_load(&state->protocolFilter);
     bool active = aether_atomic_load(&state->interceptionActive);
 
     NSMutableString *pfRule = [NSMutableString string];
