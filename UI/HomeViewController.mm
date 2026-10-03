@@ -99,6 +99,18 @@
                                                                            target:self action:@selector(dismissTapped)];
     close.tintColor = [AppTheme colorGoldMuted];
     self.navigationItem.rightBarButtonItem = close;
+
+    // Refresh button on left
+    UIBarButtonItem *refresh = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                                             target:self action:@selector(refreshTapped)];
+    refresh.tintColor = [AppTheme colorGold];
+    self.navigationItem.leftBarButtonItem = refresh;
+
+    // Pull-to-refresh
+    UIRefreshControl *refreshControl = [[UIRefreshControl alloc] init];
+    refreshControl.tintColor = [AppTheme colorGold];
+    [refreshControl addTarget:self action:@selector(refreshTapped) forControlEvents:UIControlEventValueChanged];
+    _table.refreshControl = refreshControl;
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -138,6 +150,11 @@
 
 - (void)dismissTapped {
     [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)refreshTapped {
+    [_table.refreshControl endRefreshing];
+    [self reloadData];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
