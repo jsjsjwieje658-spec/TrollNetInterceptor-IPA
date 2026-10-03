@@ -15,9 +15,29 @@
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/time.h>
-#include <net/bpf.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+// BPF (Berkeley Packet Filter) constants — iOS SDK doesn't ship net/bpf.h
+// so we define the few constants we need manually.
+struct bpf_version {
+    u_int8_t bv_major;
+    u_int8_t bv_minor;
+};
+struct bpf_hdr {
+    struct bpf_timeval bh_tstamp;  // timestamp
+    u_int16_t          bh_hdrlen;   // header length
+    u_int16_t          bh_caplen;   // captured length
+    u_int16_t          bh_datalen;  // original length
+    u_int16_t          bh_hdroff;   // offset from start to packet
+};
+#define BIOCVERSION     _IOR('B', 101, struct bpf_version)
+#define BIOCIMMEDIATE   _IOW('B', 117, u_int)
+#define BIOCSBLEN       _IOW('B', 202, u_int)
+#define BIOCSHDRL       _IOW('B', 203, u_int)
+#define BIOCSHDRXMIT    _IOW('B', 205, u_int)
+#define BPF_WORDALIGN(x) (((x) + (4 - 1)) & ~((4 - 1)))
+
 #include "../headers/AetherNetShared.h"
 #include "../headers/PrivateSystemSPI.h"
 
