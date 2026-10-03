@@ -445,39 +445,48 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     // land (target relaunched / was busy), retry NOW with fresh logs of the
     // exact Mach failure. The payload announces itself via
     // "[hook] payload armed in target" in the merged log on success. ──
-    if (active && !aether_atomic_load(&state->isInjected)) {
-        pid_t targetPID = aether_atomic_load(&state->targetPID);
-        if (targetPID > 0) {
-            // Stage the dylib: copy to accessible world-readable path
-            NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
-            NSString *signedCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
-            NSFileManager *fm = [NSFileManager defaultManager];
-            NSString *use = ([fm fileExistsAtPath:signedCopy]) ? signedCopy : bundled;
-            if (use) {
-                [fm removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                [fm copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
-                chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
-            }
+    //
+    // Always retry when injectionMethod == 2 (root engine fallback). The
+    // dylib hooks give us real per-packet send/recv interception; the root
+    // PF engine only shapes traffic — it does NOT capture packets. So if
+    // we have Dopamine available and the initial attach fell back to PF,
+    // try the full PPL-bypass + Mach injection again.
+    if (active) {
+        uint8_t method = aether_atomic_load(&state->injectionMethod);
+        if (method == 0 || method == 2) {  // not injected at all, or only root engine
+            pid_t targetPID = aether_atomic_load(&state->targetPID);
+            if (targetPID > 0) {
+                // Stage the dylib: copy to accessible world-readable path
+                NSString *bundled = [[NSBundle mainBundle] pathForResource:@"libNetHookPayload" ofType:@"dylib"];
+                NSString *signedCopy = @"/var/mobile/Library/AetherNetHook.signed.dylib";
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSString *use = ([fm fileExistsAtPath:signedCopy]) ? signedCopy : bundled;
+                if (use) {
+                    [fm removeItemAtPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                    [fm copyItemAtPath:use toPath:@AETHER_DYLIB_INSTALL_PATH error:nil];
+                    chmod(AETHER_DYLIB_INSTALL_PATH, 0755);
+                }
 
-            // Tier 0: Dopamine PPL bypass (trust file + cs_allow_invalid) — REQUIRED on PPL devices
-            BOOL dopamineAssisted = NO;
-            if (AetherDopamineAvailable()) {
-                dopamineAssisted = AetherDopaminePrepareInjection(targetPID, AETHER_DYLIB_INSTALL_PATH);
-            }
+                // Tier 0: Dopamine PPL bypass (trust file + cs_allow_invalid) — REQUIRED on PPL devices
+                BOOL dopamineAssisted = NO;
+                if (AetherDopamineAvailable()) {
+                    dopamineAssisted = AetherDopaminePrepareInjection(targetPID, AETHER_DYLIB_INSTALL_PATH);
+                }
 
-            // Tier 1: Mach remote dlopen injection
-            char errBuf2[256] = {0};
-            int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
-            AetherLog(@"LIVE attach pid %d rc=%d dopamine=%d err=[%s]",
-                      targetPID, rc2, dopamineAssisted, errBuf2);
-            if (rc2 == 0) {
-                aether_atomic_store(&state->isInjected, true);
-                aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1);
-            } else {
-                // Tier 2: Root PF/Socket engine fallback
-                AetherApplyRootTrafficControl(targetPID, state);
-                aether_atomic_store(&state->isInjected, true);
-                aether_atomic_store(&state->injectionMethod, 2);
+                // Tier 1: Mach remote dlopen injection (gives us real socket hook capture)
+                char errBuf2[256] = {0};
+                int rc2 = AetherInjectDylibIntoPID(targetPID, AETHER_DYLIB_INSTALL_PATH, errBuf2, sizeof(errBuf2));
+                AetherLog(@"LIVE attach pid %d rc=%d dopamine=%d err=[%s]",
+                          targetPID, rc2, dopamineAssisted, errBuf2);
+                if (rc2 == 0) {
+                    aether_atomic_store(&state->isInjected, true);
+                    aether_atomic_store(&state->injectionMethod, dopamineAssisted ? 3 : 1);
+                } else if (method == 0) {
+                    // Tier 2: Root PF/Socket engine fallback (only when no prior method)
+                    AetherApplyRootTrafficControl(targetPID, state);
+                    aether_atomic_store(&state->isInjected, true);
+                    aether_atomic_store(&state->injectionMethod, 2);
+                }
             }
         }
     }
@@ -491,8 +500,12 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
     }
 
     pid_t targetPID = aether_atomic_load(&state->targetPID);
-    if (targetPID > 0 && aether_atomic_load(&state->injectionMethod) == 2) {
+    uint8_t method = aether_atomic_load(&state->injectionMethod);
+    if (targetPID > 0 && method == 2) {
         AetherApplyRootTrafficControl(targetPID, state);
+        // Start BPF capture for root-engine-only mode (dylib hooks unavailable)
+        // This gives us real packet telemetry even without in-process hooks
+        AetherStartBPFCaptureIfAvailable();
     }
 
     notify_post(kAetherNotifyStateChanged);

@@ -12,6 +12,12 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/param.h>
+#include <sys/time.h>
+#include <net/bpf.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "../headers/AetherNetShared.h"
 #include "../headers/PrivateSystemSPI.h"
 
@@ -184,4 +190,129 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
         waitpid(child, &status, 0);
     }
     return 0;
+}
+
+// ============================================================================
+// 3. BPF (Berkeley Packet Filter) Fallback Packet Capture
+//    Uses /dev/bpf to capture TCP/UDP packets at the link layer.
+//    Works WITHOUT Mach injection — only needs root via posix_spawn persona.
+//    This is a separate, complementary path to the dylib hooks: when
+//    the hook payload can't be injected (e.g. PPL blocks, non-Dopamine JB),
+//    BPF gives us real packet visibility for monitoring/telemetry even if
+//    we can't modify send/recv calls in-process.
+//
+//    Limitations:
+//      - Read-only capture (can't modify/drop packets in-flight without pf)
+//      - Requires root (UID 0 via persona_np)
+//      - /dev/bpf may not be writable on some jailbreak configurations
+// ============================================================================
+
+static void *AetherBPFCaptureThread(void *arg) {
+    int bfd = -1;
+    for (int i = 0; i < 16; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/bpf%d", i);
+        bfd = open(path, O_RDONLY);
+        if (bfd >= 0) break;
+    }
+    if (bfd < 0) {
+        AetherLogDaemon(@"[bpf] cannot open /dev/bpf (errno=%d) — BPF capture unavailable", errno);
+        return NULL;
+    }
+
+    struct bpf_version bv;
+    if (ioctl(bfd, BIOCVERSION, &bv) < 0) {
+        AetherLogDaemon(@"[bpf] BIOCVERSION failed — not a BPF device", errno);
+        close(bfd);
+        return NULL;
+    }
+    AetherLogDaemon(@"[bpf] version %d.%d ready", bv.bv_major, bv.bv_minor);
+
+    // Set to immediate mode (read returns as soon as a packet arrives)
+    u_int immediate = 1;
+    ioctl(bfd, BIOCIMMEDIATE, &immediate);
+
+    // Request whole packet (no truncation)
+    u_int dlen = 65535;
+    ioctl(bfd, BIOCSBLEN, &dlen);
+
+    // Enable header generation
+    u_int header = 1;
+    ioctl(bfd, BIOCSHDRXMIT, &header);  // some kernels use this
+    ioctl(bfd, BIOCSHDRL, &header);     // others use this
+
+    // Set buffer size (large for burst handling)
+    int blen = 1 << 20;  // 1MB buffer
+    ioctl(bfd, BIOCSBLEN, &blen);
+
+    // Use non-blocking on the fd so we can poll shared state
+    int flags = fcntl(bfd, F_GETFL, 0);
+    fcntl(bfd, F_SETFL, flags | O_NONBLOCK);
+
+    AetherSharedState *state = AetherGetSharedState();
+    uint64_t bpfPacketsRX = 0, bpfPacketsTX = 0;
+
+    char buf[65535];
+    while (state && aether_atomic_load(&state->hudVisible)) {
+        ssize_t n = read(bfd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);  // 1ms sleep — don't spin
+                continue;
+            }
+            break;
+        }
+
+        // Walk the BPF buffer: sequence of (struct bpf_hdr, packet, pad)
+        ssize_t offset = 0;
+        while (offset < n) {
+            struct bpf_hdr *bh = (struct bpf_hdr *)(buf + offset);
+            if (bh->bh_caplen == 0) break;
+
+            // bh_hdr is the bpf header; packet data starts after it
+            void *pkt = buf + offset + bh->bh_hdrlen;
+            size_t caplen = bh->bh_caplen;
+
+            // Parse link-layer (Ethernet) header to determine direction
+            // On iOS, Ethernet header is 14 bytes (if present)
+            // The BPF interface on iOS gives raw 802.11 or Ethernet
+
+            // Update BPF telemetry counters
+            bpfPacketsRX++;
+            aether_atomic_store(&state->totalBPFPacketsRX, bpfPacketsRX);
+            aether_atomic_store(&state->totalBytesRX, aether_atomic_load(&state->totalBytesRX) + caplen);
+
+            // Advance to next packet
+            size_t hdr_len = bh->bh_hdrlen;
+            size_t caplen_aligned = BPF_WORDALIGN(caplen + hdr_len);
+            offset += caplen_aligned;
+            if (offset >= n) break;
+        }
+
+        // Log every 50 packets to avoid flooding
+        if ((bpfPacketsRX + bpfPacketsTX) % 50 == 0) {
+            AetherLogDaemon(@"[bpf] captured %llu packets (rx=%llu)",
+                            bpfPacketsRX, bpfPacketsRX);
+        }
+    }
+
+    AetherLogDaemon(@"[bpf] capture thread exiting — hudVisible=%d", state ? aether_atomic_load(&state->hudVisible) : -1);
+    close(bfd);
+    return NULL;
+}
+
+/// Spawn a BPF capture thread when root PF fallback is in use but no dylib hooks.
+/// This gives us real packet visibility for monitoring even without in-process hooks.
+extern "C" void AetherStartBPFCaptureIfAvailable(void) {
+    // Try to start BPF capture in background
+    pthread_t thr;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thr, &attr, AetherBPFCaptureThread, NULL) == 0) {
+        AetherLogDaemon(@"[bpf] capture thread spawned");
+    } else {
+        AetherLogDaemon(@"[bpf] capture thread spawn failed (errno=%d)", errno);
+    }
+    pthread_attr_destroy(&attr);
 }

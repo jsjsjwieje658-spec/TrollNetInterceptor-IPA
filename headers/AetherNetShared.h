@@ -167,9 +167,13 @@ typedef struct __attribute__((aligned(64))) {
     _Atomic(uint64_t) totalBytesTX;
     _Atomic(uint64_t) heldPacketsCount;      // Currently buffered/held in queue
     _Atomic(uint64_t) droppedPacketsCount;   // Total dropped/intercepted packets
-    _Atomic(uint32_t) currentRXRateBps;
+     _Atomic(uint32_t) currentRXRateBps;
     _Atomic(uint32_t) currentTXRateBps;
     _Atomic(uint32_t) currentPacketRatePps;
+
+    // --- BPF Capture Telemetry (root engine fallback) ---
+    _Atomic(uint64_t) totalBPFPacketsRX;
+    _Atomic(uint64_t) totalBPFPacketsTX;
 
     // --- Snapshot of Active L4 Connections in Target PID ---
     uint32_t          socketEntryCount;
@@ -182,6 +186,9 @@ extern "C" {
 
 AetherSharedState *AetherGetSharedState(void);
 void AetherResetTelemetryForNewTarget(AetherSharedState *state, pid_t pid, const char *name, const char *bundleID, const char *execPath);
+
+// BPF capture thread — spawn for root-engine-only mode when dylib hooks unavailable
+void AetherStartBPFCaptureIfAvailable(void);
 
 #ifdef __cplusplus
 }
