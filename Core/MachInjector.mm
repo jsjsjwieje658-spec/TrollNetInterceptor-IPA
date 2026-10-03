@@ -20,43 +20,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-// libproc.h is not in iOS SDK — manually declare proc_pidinfo interface
-// (from XNU libproc/proc_info.h)
-#define PROC_PIDLISTSOCKETS   5
-#define PROC_PIDFDSOCKETINFO  6
-#define PROC_PIDTASKALLINFO   7
-#define S_IFSOCK 0xC000
-#define PROC_SOCKET_FD_LISTEN 0x01
-
-struct proc_bsdinfo {
-    uint32_t pbi_fd;
-    uint32_t pbi_kind;
-    // ... other fields
-};
-
-struct socket_fdinfo {
-    uint32_t pinfo;
-    struct so_info soi;
-};
-
-struct so_info {
-    uint32_t soi_kind;
-    uint32_t soi_type;
-    uint32_t soi_family;
-    uint32_t soi_protocol;
-    uint32_t soi_state;
-    uint64_t soi_rcv;
-    uint64_t soi_snd;
-};
-
-extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
-
+#include "../headers/AetherNetShared.h"
+#include "../headers/PrivateSystemSPI.h"
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-
-#include "../headers/AetherNetShared.h"
-#include "../headers/PrivateSystemSPI.h"
 
 extern "C" char **environ;
 
@@ -231,14 +199,9 @@ extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state
 
 // ============================================================================
 // 3. Socket Telemetry Monitor Thread (Root PF/Dummynet Fallback Companion)
-//    Runs as a background thread, uses libproc SPI to enumerate TCP/UDP
-//    sockets in the target process every 100ms. Counts connection state
-//    changes, new sockets, and closed sockets — providing real packet-flow
-//    visibility when the dylib hooks can't be injected (PPL blocks, etc).
-//
-//    Uses proc_pidinfo() with PROC_PIDTASKALLINFO / PROC_PIDLISTSOCKETS
-//    — a public kernel SPI that returns live socket metadata including
-//    local/remote endpoints, protocol, and TCP state.
+//    Runs as a background thread, uses libproc SPI (proc_pidfdinfo) to
+//    enumerate TCP/UDP sockets in the target process every 100ms.
+//    Provides real packet-flow visibility when dylib hooks can't inject.
 // ============================================================================
 
 static void *AetherSocketTelemetryThread(void *arg) {
@@ -248,12 +211,11 @@ static void *AetherSocketTelemetryThread(void *arg) {
 
     AetherLogDaemon(@"[socket-monitor] thread started for pid %d", targetPID);
 
-    uint64_t lastTCPCount = 0, lastUDPCount = 0;
+    uint32_t lastTCPCount = 0, lastUDPCount = 0;
     uint64_t totalTCPChanges = 0, totalUDPChanges = 0;
 
     while (state && aether_atomic_load(&state->hudVisible)) {
         uint8_t currentMethod = aether_atomic_load(&state->injectionMethod);
-        // If dylib hooks became available, stop the monitor thread
         if (currentMethod == 1 || currentMethod == 3) {
             AetherLogDaemon(@"[socket-monitor] dylib hooks available (method=%u) — stopping monitor", currentMethod);
             break;
@@ -262,51 +224,55 @@ static void *AetherSocketTelemetryThread(void *arg) {
         pid_t currentPID = aether_atomic_load(&state->targetPID);
         bool interception = aether_atomic_load(&state->interceptionActive);
         if (currentPID != targetPID || !interception) {
-            usleep(500000); // 500ms when idle
+            usleep(500000);
             continue;
         }
 
-        // Enumerate sockets in the target process
-        int bufSize = proc_pidinfo(targetPID, PROC_PIDLISTSOCKETS, 0, NULL, 0);
+        // Enumerate sockets via proc_pidinfo with PROC_PIDLISTFDS (same as ProcessManager)
+        int bufSize = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, NULL, 0);
         if (bufSize <= 0) {
             usleep(100000);
             continue;
         }
 
-        int nEntries = bufSize / sizeof(struct proc_bsdinfo);
-        struct proc_bsdinfo *entries = (struct proc_bsdinfo *)malloc(bufSize);
-        if (!entries) {
+        struct proc_fdinfo *fds = (struct proc_fdinfo *)malloc(bufSize);
+        if (!fds) {
             usleep(100000);
             continue;
         }
 
-        int bytesReturned = proc_pidinfo(targetPID, PROC_PIDLISTSOCKETS, 0, entries, bufSize);
-        nEntries = bytesReturned / sizeof(struct proc_bsdinfo);
-
-        uint32_t tcpCount = 0, udpCount = 0;
-        for (int i = 0; i < nEntries; i++) {
-            // Determine protocol from soi_kind — for TCP, soi_kind is SOCK_STREAM+1
-            // For UDP, it's SOCK_DGRAM+1. The proc_bsdinfo struct has soi_kind in
-            // the struct so_info field, but we need struct socket_fdinfo for full detail.
-            // Use a simpler approach: count socket types via the fd info.
-            uint32_t p = entries[i].pbi_kind;
-            if (p == S_IFSOCK) {
-                // This is a socket fd — get extended info
-                struct socket_fdinfo sinfo;
-                int rc = proc_pidinfo(targetPID, PROC_PIDFDSOCKETINFO, entries[i].pbi_fd, &sinfo, sizeof(sinfo));
-                if (rc == sizeof(sinfo)) {
-                    if (sinfo.pinfo.pelem.fd.sfe_flags & PROC_SOCKET_FD_LISTEN) {
-                        if (sinfo.soi_kind == SOCK_STREAM + 1) tcpCount++;
-                        else if (sinfo.soi_kind == SOCK_DGRAM + 1) udpCount++;
-                    }
-                }
-            }
+        int actual = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, fds, bufSize);
+        if (actual <= 0) {
+            free(fds);
+            usleep(100000);
+            continue;
         }
 
+        int fdCount = actual / sizeof(struct proc_fdinfo);
+        uint32_t tcpCount = 0, udpCount = 0;
+
+        for (int i = 0; i < fdCount; i++) {
+            if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET) continue;
+
+            struct aether_socket_fdinfo sinfo;
+            int rc = proc_pidfdinfo(targetPID, fds[i].proc_fd, PROC_PIDFDSOCKETINFO, &sinfo, sizeof(sinfo));
+            if (rc != sizeof(sinfo)) continue;
+
+            int family = sinfo.psi.soi_family;
+            if (family != AF_INET && family != AF_INET6) continue;
+
+            int sockType = sinfo.psi.soi_type;
+            if (sockType == SOCK_STREAM) tcpCount++;
+            else if (sockType == SOCK_DGRAM) udpCount++;
+            else continue;
+        }
+
+        free(fds);
+
         if (tcpCount != lastTCPCount || udpCount != lastUDPCount) {
-            totalTCPChanges++;
+            totalTCPChanges += (tcpCount != lastTCPCount) ? 1 : 0;
             totalUDPChanges += (udpCount != lastUDPCount) ? 1 : 0;
-            AetherLogDaemon(@"[socket-monitor] sockets changed: TCP=%u UDP=%u (was TCP=%llu UDP=%llu)",
+            AetherLogDaemon(@"[socket-monitor] sockets changed: TCP=%u UDP=%u (was TCP=%u UDP=%u)",
                             tcpCount, udpCount, lastTCPCount, lastUDPCount);
             lastTCPCount = tcpCount;
             lastUDPCount = udpCount;
@@ -314,8 +280,7 @@ static void *AetherSocketTelemetryThread(void *arg) {
             aether_atomic_store(&state->activeUDPSockets, udpCount);
         }
 
-        free(entries);
-        usleep(100000); // poll every 100ms
+        usleep(100000);
     }
 
     AetherLogDaemon(@"[socket-monitor] thread exiting — total TCP changes=%llu, UDP changes=%llu",
@@ -324,8 +289,6 @@ static void *AetherSocketTelemetryThread(void *arg) {
 }
 
 /// Spawn a socket telemetry monitor thread for root-engine-only mode.
-/// When dylib hooks can't inject (PPL blocks), this gives us live socket
-/// count tracking and TCP/UDP connection state visibility via libproc.
 extern "C" void AetherStartBPFCaptureIfAvailable(void) {
     AetherSharedState *state = AetherGetSharedState();
     if (!state) return;
