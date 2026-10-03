@@ -22,7 +22,8 @@
 #import "NECPCapture.h"
 #import "AetherLog.h"
 #import "../headers/AetherNetShared.h"
-#import <sys/socket.h>
+#import "../headers/PrivateSystemSPI.h"
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -33,6 +34,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <uuid/uuid.h>
+#include <stdatomic.h>
 
 // NECP SPI (private but stable across iOS 12+)
 extern "C" {
@@ -80,6 +82,9 @@ struct necp_policy_parameter {
 #define NECP_KERNEL_POLICY_ACTION_ALLOW    1
 #define NECP_KERNEL_POLICY_ACTION_DROP     2
 #define NECP_KERNEL_POLICY_ACTION_DIVERT   3  // Copy packet to userspace socket
+
+// libproc constants (not in iOS SDK headers)
+#define PROC_PIDTBSDINFO  3
 
 // Divert socket for receiving packet copies
 static int gNECPDivertSocket = -1;
@@ -132,22 +137,22 @@ static void *AetherNECPWorkerThread(void *arg) {
         inet_ntop(AF_INET, &iph->ip_src, srcIP, sizeof(srcIP));
         inet_ntop(AF_INET, &iph->ip_dst, dstIP, sizeof(dstIP));
         
-        // Determine direction (simplified: outbound if src matches our interface)
-        const char *direction = "?";
-        
         // Log to daemon log (will merge to app Log tab)
         AetherLogDaemon(@"[necp] CAPTURE %s %s:%u -> %s:%u len=%zd",
                         protoStr, srcIP, srcPort, dstIP, dstPort, len);
         
-        // Update shared memory counters
+        // Update shared memory counters (use atomic load/store instead of fetch_add)
         AetherSharedState *state = AetherGetSharedState();
         if (state) {
             if (proto == IPPROTO_TCP) {
-                aether_atomic_fetch_add_explicit(&state->totalTCPPacketsRX, 1, memory_order_relaxed);
+                uint64_t v = aether_atomic_load(&state->totalTCPPacketsRX);
+                aether_atomic_store(&state->totalTCPPacketsRX, v + 1);
             } else if (proto == IPPROTO_UDP) {
-                aether_atomic_fetch_add_explicit(&state->totalUDPPacketsRX, 1, memory_order_relaxed);
+                uint64_t v = aether_atomic_load(&state->totalUDPPacketsRX);
+                aether_atomic_store(&state->totalUDPPacketsRX, v + 1);
             }
-            aether_atomic_fetch_add_explicit(&state->totalBytesRX, len, memory_order_relaxed);
+            uint64_t b = aether_atomic_load(&state->totalBytesRX);
+            aether_atomic_store(&state->totalBytesRX, b + len);
         }
     }
     
@@ -158,6 +163,41 @@ static void *AetherNECPWorkerThread(void *arg) {
 // Get process UUID for NECP matching (via proc_pidinfo)
 static BOOL AetherNECPGetProcessUUID(pid_t pid, uuid_t outUUID) {
     // On iOS, process UUID is in proc_bsdinfo.pbi_uuid
+    struct proc_bsdinfo {
+        uint32_t pbi_flags;
+        uint32_t pbi_status;
+        uint32_t pbi_xstatus;
+        uint32_t pbi_pid;
+        uint32_t pbi_ppid;
+        uid_t    pbi_uid;
+        gid_t    pbi_gid;
+        uint32_t pbi_ruid;
+        uint32_t pbi_rgid;
+        uint32_t pbi_svuid;
+        uint32_t pbi_svgid;
+        uint32_t rfu_1;
+        char     pbi_comm[16];
+        char     pbi_name[16];
+        uint32_t pbi_nfiles;
+        uint32_t pbi_nfilesmax;
+        uint32_t pbi_nexecs;
+        uint32_t pbi_pgid;
+        int32_t  pbi_pjobc;
+        uint32_t pbi_tdev;
+        uint32_t pbi_tpgid;
+        uint32_t pbi_nice;
+        uint64_t pbi_start_tvsec;
+        uint64_t pbi_start_tvusec;
+        uint64_t pbi_cputime;
+        uint64_t pbi_utime;
+        uint64_t pbi_stime;
+        uint64_t pbi_maxrss;
+        uint64_t pbi_ixrss;
+        uint64_t pbi_idrss;
+        uint64_t pbi_isrss;
+        uuid_t   pbi_uuid;  // <-- this is what we need
+    };
+    
     struct proc_bsdinfo bsdInfo;
     int rc = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdInfo, sizeof(bsdInfo));
     if (rc == sizeof(bsdInfo)) {
