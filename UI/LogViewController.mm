@@ -90,12 +90,26 @@
     _tv.refreshControl = refresh;
 
     // --- Auto-refresh every 1.0s (fires during scroll via CommonModes) ---
+    [self startAutoRefresh];
+}
+
+// The timer block captures self, and the run loop retains the timer, so the
+// controller must tear the timer down explicitly or it can never be freed.
+- (void)startAutoRefresh {
+    if (_refreshTimer) return;
+    __weak typeof(self) weakSelf = self;
     _refreshTimer = [NSTimer timerWithTimeInterval:1.0
                                            repeats:YES
                                              block:^(NSTimer *timer) {
-        [self refreshLog];
+        (void)timer;
+        [weakSelf refreshLog];
     }];
     [[NSRunLoop mainRunLoop] addTimer:_refreshTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopAutoRefresh {
+    [_refreshTimer invalidate];
+    _refreshTimer = nil;
 }
 
 - (UIButton *)makeToolButton:(NSString *)title action:(SEL)sel {
@@ -113,11 +127,13 @@
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    [self startAutoRefresh];
     [self refreshLog];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
+    [self stopAutoRefresh];
 }
 
 - (void)manualRefresh {

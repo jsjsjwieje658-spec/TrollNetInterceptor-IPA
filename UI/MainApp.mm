@@ -71,9 +71,18 @@
     _lastTXBytes = tx;
 
     // --- 2. Per-PID socket telemetry refresh (from XNU libproc SPI) ---
+    // Previously this only ran when the dylib had been injected, which meant
+    // the socket table (and therefore the PF rule set and the BPF port
+    // matcher) went stale exactly in the case where they matter most: no
+    // injection.  Refresh whenever we have a target and any lane is live.
     pid_t pid = aether_atomic_load(&state->targetPID);
-    if (pid > 0 && aether_atomic_load(&state->isInjected)) {
-        [[AetherProcessManager sharedManager] refreshSocketTelemetryForPID:pid];
+    if (pid > 0) {
+        bool injected  = aether_atomic_load(&state->isInjected);
+        bool capturing = aether_atomic_load(&state->interceptionActive);
+        uint32_t lanes = aether_atomic_load(&state->activeLanes);
+        if (injected || capturing || lanes != 0) {
+            [[AetherProcessManager sharedManager] refreshSocketTelemetryForPID:pid];
+        }
     }
 
     // --- 3. Safety auto-flush of held packets (time-based, not count-modulo) ---
@@ -208,6 +217,9 @@
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[AetherProcessManager sharedManager] setGlobalFloatingHUDEnabled:YES];
         });
+        // Arm the supervisor even if the spawn above turns out to be a no-op
+        // (daemon already running from a previous launch).
+        [[AetherProcessManager sharedManager] startHUDWatchdog];
     }
 
     // Stale-daemon auto-upgrade: the HUD daemon is a spawned root process that

@@ -6,7 +6,9 @@
 //   1. INTERCEPTION RULES
 //        - Direction:  Both ▸ Download only ▸ Upload only
 //        - Protocol:   TCP + UDP ▸ UDP only ▸ TCP only
-//        - Mode:       Hold Queue ▸ Drop ▸ Delay+Jitter ▸ Tamper
+//        - Mode:       Hold Queue ▸ Drop ▸ Delay+Jitter ▸ Tamper ▸ Observe
+//                      (Observe = capture only: nothing is held, nothing is
+//                       frozen — the target keeps running normally)
 //        - Master capture ratio slider (0-100 %)
 //        - Download hold ratio & Upload hold ratio sliders
 //   2. NETWORK STATE SIMULATION
@@ -21,6 +23,7 @@
 
 #import "SettingsViewController.h"
 #import "AppTheme.h"
+#import "../Core/L4Engine/AetherShaper.h"
 #import "../Core/ProcessManager.h"
 #import "../headers/AetherNetShared.h"
 #include <math.h>
@@ -60,6 +63,12 @@
 @property (nonatomic, strong) UISwitch *snapSwitch;
 @property (nonatomic, strong) UISwitch *lockSwitch;
 @property (nonatomic, strong) UISwitch *hapticSwitch;
+@property (nonatomic, strong) UISwitch *freezeSwitch;
+@property (nonatomic, strong) UILabel  *modeAvailNote;
+@property (nonatomic, strong) UISlider *lagSpikeSlider;
+@property (nonatomic, strong) UILabel  *lagSpikeValue;
+@property (nonatomic, strong) UISlider *lagCycleSlider;
+@property (nonatomic, strong) UILabel  *lagCycleValue;
 @property (nonatomic, strong) UISlider *xSlider;
 @property (nonatomic, strong) UILabel *xValue;
 @property (nonatomic, strong) UISlider *ySlider;
@@ -129,7 +138,7 @@
     return seg;
 }
 
-- (UIView *)makeSliderRow:(NSString *)title
+- (UISlider *)makeSliderRow:(NSString *)title
                     min:(double)minV
                     max:(double)maxV
                   parent:(UIView *)parent
@@ -202,13 +211,39 @@
                                                 action:@selector(protocolChanged:)];
 
     UILabel *modeLabel = [self rowTitle:@"Intercept mode" into:rulesCard above:self.protocolSegment constant:16];
-    self.modeSegment = [self makeSegmentWithItems:@[@"Hold", @"Drop", @"Delay", @"Tamper"]
+    self.modeSegment = [self makeSegmentWithItems:@[@"Hold", @"Drop", @"Delay", @"Tamper", @"Observe"]
                                             parent:rulesCard above:modeLabel constant:8
                                             action:@selector(modeChanged:)];
+    // Five labels no longer fit at equal width: let each segment size itself.
+    self.modeSegment.apportionsSegmentWidthsByContent = YES;
+
+    // 4.1.3 — freezing the target is opt-in.  Without pfctl/dnctl and without
+    // injection the only way to "hold" traffic is SIGSTOP, which stops the app
+    // from rendering at all; the user has to ask for that explicitly.
+    self.modeAvailNote = [self rowTitle:@"" into:rulesCard above:self.modeSegment constant:8];
+    self.modeAvailNote.font = [AppTheme displayFont:11.5];
+    self.modeAvailNote.textColor = [AppTheme colorWarnRed];
+    self.modeAvailNote.numberOfLines = 0;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.modeAvailNote.trailingAnchor constraintEqualToAnchor:rulesCard.trailingAnchor constant:-16],
+    ]];
+
+    self.freezeSwitch = [self addSwitchRow:@"Freeze target (SIGSTOP)"
+                                    parent:rulesCard above:self.modeAvailNote
+                                    action:@selector(freezeToggled:)];
+
+    UILabel *freezeNote = [self rowTitle:@"OFF by default — the app keeps rendering and AetherNet only captures. Turn ON only if you really want to stop the target process."
+                                    into:rulesCard above:self.freezeSwitch constant:8];
+    freezeNote.font = [AppTheme displayFont:11.5];
+    freezeNote.textColor = [AppTheme colorTextSecondary];
+    freezeNote.numberOfLines = 0;
+    [NSLayoutConstraint activateConstraints:@[
+        [freezeNote.trailingAnchor constraintEqualToAnchor:rulesCard.trailingAnchor constant:-16],
+    ]];
 
     self.masterRatioSlider = [self makeSliderRow:@"Master capture ratio"
                                               min:0 max:100 parent:rulesCard
-                                            above:self.modeSegment constant:16
+                                            above:freezeNote constant:16
                                             slider:&_masterRatioSlider value:&_masterRatioValue
                                             action:@selector(masterRatioChanged:)];
 
@@ -262,7 +297,27 @@
     self.autoFlushSegment = [self makeSegmentWithItems:@[@"Off", @"5s", @"12s", @"30s"]
                                                  parent:simCard above:flushLabel constant:8
                                                  action:@selector(autoFlushChanged:)];
-    [self pinLastControl:self.autoFlushSegment toCardBottom:simCard];
+    self.lagSpikeSlider = [self makeSliderRow:@"Ping spike (stall the app)"
+                                          min:0 max:1000 parent:simCard
+                                        above:self.autoFlushSegment constant:16
+                                        slider:&_lagSpikeSlider value:&_lagSpikeValue
+                                        action:@selector(lagSpikeChanged:)];
+    self.lagCycleSlider = [self makeSliderRow:@"Spike every"
+                                          min:100 max:2000 parent:simCard
+                                        above:self.lagSpikeSlider constant:10
+                                        slider:&_lagCycleSlider value:&_lagCycleValue
+                                        action:@selector(lagCycleChanged:)];
+
+    UILabel *lagNote = [self rowTitle:@"0 ms = OFF. This is a lag switch: the app is stopped on purpose, so it stutters while a spike is running. Takes effect without restarting interception."
+                                 into:simCard above:self.lagCycleSlider constant:8];
+    lagNote.font = [AppTheme displayFont:11.5];
+    lagNote.textColor = [AppTheme colorTextSecondary];
+    lagNote.numberOfLines = 0;
+    [NSLayoutConstraint activateConstraints:@[
+        [lagNote.trailingAnchor constraintEqualToAnchor:simCard.trailingAnchor constant:-16],
+    ]];
+
+    [self pinLastControl:lagNote toCardBottom:simCard];
 
     // ================= 3. FLOATING BUTTON =================
     UIView *hudTitle;
@@ -367,6 +422,7 @@ static uint32_t SliderToBandwidth(double sliderValue) {
 }
 
 static int RoundBandwidthToSlider(uint32_t kbps) {
+    if (kbps == 0) return 0;               // unlimited — slider position 0
     for (int s = 1; s <= 100; s++) {
         if (SliderToBandwidth((double)s) >= kbps) return s;
     }
@@ -385,6 +441,11 @@ static int RoundBandwidthToSlider(uint32_t kbps) {
     self.directionSegment.selectedSegmentIndex = aether_atomic_load(&state->direction);
     self.protocolSegment.selectedSegmentIndex = aether_atomic_load(&state->protocolFilter);
     self.modeSegment.selectedSegmentIndex = aether_atomic_load(&state->interceptMode);
+    self.freezeSwitch.on = aether_atomic_load(&state->allowFreeze) != 0;
+
+    self.lagSpikeSlider.value = (float)aether_atomic_load(&state->lagSpikeMs);
+    self.lagCycleSlider.value = (float)aether_atomic_load(&state->lagCycleMs);
+    [self refreshModeAvailability];
 
     self.masterRatioSlider.value = (float)aether_atomic_load(&state->captureRatioPercent);
     self.downloadSlider.value = (float)aether_atomic_load(&state->downloadHoldPercent);
@@ -431,6 +492,10 @@ static int RoundBandwidthToSlider(uint32_t kbps) {
     self.latencyValue.text = [NSString stringWithFormat:@"%d ms", (int)self.latencySlider.value];
     self.jitterValue.text = [NSString stringWithFormat:@"%d ms", (int)self.jitterSlider.value];
     self.duplicateValue.text = [NSString stringWithFormat:@"%d %%", (int)self.duplicateSlider.value];
+    int spike = ((int)self.lagSpikeSlider.value / 10) * 10;
+    int cycle = ((int)self.lagCycleSlider.value / 100) * 100;
+    self.lagSpikeValue.text = (spike < 10) ? @"off" : [NSString stringWithFormat:@"%d ms", spike];
+    self.lagCycleValue.text = [NSString stringWithFormat:@"%d ms", cycle];
     self.sizeValue.text = [NSString stringWithFormat:@"%d pt", (int)self.sizeSlider.value];
     self.opacityValue.text = [NSString stringWithFormat:@"%d %%", (int)self.opacitySlider.value];
     self.xValue.text = [NSString stringWithFormat:@"%d %%", (int)self.xSlider.value];
@@ -455,6 +520,69 @@ static int RoundBandwidthToSlider(uint32_t kbps) {
     AetherSharedState *state = AetherGetSharedState();
     if (state) aether_atomic_store(&state->interceptMode, (uint8_t)seg.selectedSegmentIndex);
     [self notifyConfigChanged];
+}
+
+- (void)freezeToggled:(UISwitch *)toggle {
+    AetherSharedState *state = AetherGetSharedState();
+    if (state) aether_atomic_store(&state->allowFreeze, (uint8_t)(toggle.on ? 1 : 0));
+    [self refreshModeAvailability];
+    [self notifyConfigChanged];
+}
+
+- (void)lagSpikeChanged:(UISlider *)slider {
+    AetherSharedState *state = AetherGetSharedState();
+    uint32_t v = (((uint32_t)slider.value) / 10u) * 10u;
+    if (v < 10u) v = 0u;
+    if (state) aether_atomic_store(&state->lagSpikeMs, v);
+    [self refreshAllValueLabels];
+    [self notifyConfigChanged];
+}
+
+- (void)lagCycleChanged:(UISlider *)slider {
+    AetherSharedState *state = AetherGetSharedState();
+    uint32_t v = (((uint32_t)slider.value) / 100u) * 100u;
+    if (v < 100u) v = 100u;
+    if (state) aether_atomic_store(&state->lagCycleMs, v);
+    [self refreshAllValueLabels];
+    [self notifyConfigChanged];
+}
+
+// Grey out every mode this device cannot enforce instead of letting the user
+// pick something that will silently do nothing.
+- (void)refreshModeAvailability {
+    AetherSharedState *state = AetherGetSharedState();
+    if (!state) return;
+
+    uint32_t caps = AetherShaperCapabilities();
+    BOOL injected = aether_atomic_load(&state->isInjected) != 0;
+    BOOL canQueue = injected ||
+                    (caps & (AETHER_SHAPER_CAP_PFCTL | AETHER_SHAPER_CAP_DUMMYNET)) != 0;
+    BOOL canHoldOrDrop = canQueue ||
+                    (aether_atomic_load(&state->allowFreeze) &&
+                     (caps & AETHER_SHAPER_CAP_FREEZE));
+
+    [self.modeSegment setEnabled:canHoldOrDrop forSegmentAtIndex:0];   // Hold
+    [self.modeSegment setEnabled:canHoldOrDrop forSegmentAtIndex:1];   // Drop
+    [self.modeSegment setEnabled:canQueue      forSegmentAtIndex:2];   // Delay
+    [self.modeSegment setEnabled:canQueue      forSegmentAtIndex:3];   // Tamper
+    [self.modeSegment setEnabled:YES           forSegmentAtIndex:4];   // Observe
+
+    uint8_t mode = aether_atomic_load(&state->interceptMode);
+    BOOL currentOK = (mode == AetherModeObserve) ? YES
+                   : ((mode == AetherModeHoldQueue || mode == AetherModeDropPacket)
+                        ? canHoldOrDrop : canQueue);
+    if (!currentOK) {
+        aether_atomic_store(&state->interceptMode, (uint8_t)AetherModeObserve);
+        self.modeSegment.selectedSegmentIndex = AetherModeObserve;
+    }
+
+    if (canQueue) {
+        self.modeAvailNote.text = @"";
+    } else if (canHoldOrDrop) {
+        self.modeAvailNote.text = @"Delay / Tamper: unavailable - this device has no pfctl/dnctl and the in-process hook could not be loaded.";
+    } else {
+        self.modeAvailNote.text = @"Only Observe can run here (no pfctl, no dnctl, injection unavailable). Hold / Drop need 'Freeze target' below.";
+    }
 }
 
 - (void)masterRatioChanged:(UISlider *)slider {

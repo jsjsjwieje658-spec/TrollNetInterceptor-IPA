@@ -447,7 +447,7 @@
     [_contentView addSubview:header];
 
     self.spawnHUDButton = [[AetherGoldButton alloc] initWithTitle:@"+  Create Floating Button"];
-    [self.spawnHUDButton addTarget:self action:@selector(toggleHUD) forControlEvents:UIControlEventTouchUpInside];
+    [self.spawnHUDButton addTarget:self action:@selector(toggleHUD:event:) forControlEvents:UIControlEventTouchUpInside];
     [self.spawnHUDButton applySecondaryStyle];
     [card addSubview:self.spawnHUDButton];
 
@@ -519,9 +519,40 @@
     [self reloadFromSharedState];
 }
 
-- (void)toggleHUD {
-    [[AetherProcessManager sharedManager] setGlobalFloatingHUDEnabled:![[AetherProcessManager sharedManager] isGlobalFloatingHUDRunning]];
+- (void)toggleHUD:(id)sender event:(UIEvent *)event {
+    AetherSharedState *state = AetherGetSharedState();
+
+    // A tap on the floating button reaches this screen too, because the HUD
+    // daemon only observes raw HID events — it cannot swallow them.  If the
+    // daemon consumed a tap at this very point a moment ago, this press is the
+    // same gesture and must not tear the HUD down.
+    if (state) {
+        uint64_t tapMs = aether_atomic_load(&state->hudTapConsumedMs);
+        uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+        if (tapMs > 0 && nowMs >= tapMs && (nowMs - tapMs) < 700) {
+            CGPoint p = [[[event allTouches] anyObject] locationInView:nil];
+            float bx = aether_atomic_load(&state->floatingPosX);
+            float by = aether_atomic_load(&state->floatingPosY);
+            float br = aether_atomic_load(&state->floatingButtonSize) * 0.5f + 12.0f;
+            BOOL inside = (p.x <= 0 && p.y <= 0) ||   // no coordinates available
+                          (fabs((double)p.x - bx) <= br && fabs((double)p.y - by) <= br);
+            if (inside) {
+                AetherLog(@"ignoring HUD toggle — the floating button already handled "
+                          @"this tap (%d ms ago)", (int)(nowMs - tapMs));
+                [self reloadFromSharedState];
+                return;
+            }
+        }
+    }
+
+    BOOL running = [[AetherProcessManager sharedManager] isGlobalFloatingHUDRunning];
+    AetherLog(@"HUD toggle pressed (running=%d)", running ? 1 : 0);
+    [[AetherProcessManager sharedManager] setGlobalFloatingHUDEnabled:!running];
     [self reloadFromSharedState];
+}
+
+- (void)toggleHUD {
+    [self toggleHUD:nil event:nil];
 }
 
 - (void)reloadFromSharedState {
@@ -570,11 +601,25 @@
     self.spawnHUDButton.buttonLabel.text = hudRunning ? @"−  Remove Floating Button" : @"+  Create Floating Button";
 
     // Status label
-    NSString *methodStr = (method == 1) ? @"Mach dylib hooks" :
-                         (method == 4) ? @"NECP + Root PF" :
-                         (method == 0) ? @"NECP only" : @"Root PF only";
-    self.statusLabel.text = [NSString stringWithFormat:@"Status: %@  •  Mode: %@",
-                             active ? @"Capturing" : @"Idle", methodStr];
+    NSString *methodStr = nil;
+    switch ((AetherCaptureMethod)method) {
+        case AetherMethodInProcess:    methodStr = @"In-process hooks (P1+P2)"; break;
+        case AetherMethodKernelTap:    methodStr = @"BPF kernel tap (P3)";      break;
+        case AetherMethodShaper:       methodStr = @"PF / freeze (P4)";         break;
+        case AetherMethodTapAndShaper: methodStr = @"BPF tap + PF (P3+P4)";     break;
+        case AetherMethodFull:         methodStr = @"Hooks + BPF (P1+P2+P3)";   break;
+        case AetherMethodNone:
+        default:                       methodStr = @"Idle";                     break;
+    }
+    uint32_t lanes = aether_atomic_load(&state->activeLanes);
+    NSString *detail = state->engineStatus[0]
+        ? [NSString stringWithUTF8String:state->engineStatus]
+        : @"";
+    self.statusLabel.text = [NSString stringWithFormat:@"Status: %@  •  %@%@%@",
+                             active ? @"Capturing" : @"Idle", methodStr,
+                             detail.length ? @"\n" : @"",
+                             detail.length ? detail :
+                             [NSString stringWithFormat:@"lanes=%u", lanes]];
 }
 
 - (void)showToast:(NSString *)msg {
