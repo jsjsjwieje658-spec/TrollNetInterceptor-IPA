@@ -39,11 +39,14 @@ template <class T, class V> inline T        aether_atomic_fetch_add(std::atomic<
 #define AETHER_SHM_PATH             "/var/mobile/Library/Caches/com.aethernet.shared.shm"
 #define AETHER_HUD_PID_PATH         "/var/mobile/Library/Caches/com.aethernet.hud.pid"
 #define AETHER_DYLIB_INSTALL_PATH   "/var/mobile/Library/Caches/libNetHookPayload.dylib"
-#define AETHER_SHM_MAGIC            0xAE74E207U
+// Magic bumped to ...208 for the v4 "path-aware" capture engine: the struct
+// gained the lane/capability block, so stale state from v3.x is discarded
+// instead of being misinterpreted.
+#define AETHER_SHM_MAGIC            0xAE74E208U
 // Daemon handshake: HUD daemon stores its build here every heartbeat; the app
 // respawns a stale daemon after an app update. KEEP IN SYNC with build number
 // in scripts/crossbuild-linux.sh
-#define AETHER_BUILD_NUM            360U
+#define AETHER_BUILD_NUM            415U
 
 // Darwin Notifications for instant cross-process wakeups
 #define kAetherNotifyStateChanged   "com.aethernet.interceptor.state_changed"
@@ -68,8 +71,42 @@ typedef enum : uint8_t {
     AetherModeHoldQueue     = 0, // Hold packets in memory buffer until toggled OFF (Freeze/Ghost)
     AetherModeDropPacket    = 1, // Silently drop matching packets (Loss simulation)
     AetherModeDelayJitter   = 2, // Inject artificial latency + jitter + bandwidth cap
-    AetherModeCorruptTamper = 3  // Bit-flip / truncate non-header payload bytes
+    AetherModeCorruptTamper = 3, // Bit-flip / truncate non-header payload bytes
+    AetherModeObserve       = 4  // Capture only: count + log every packet, never
+                                 // hold / drop / delay / tamper, never freeze the
+                                 // target.  This is what the kernel tap (P3) does
+                                 // when there is no injection (P1/P2) available.
 } AetherInterceptMode;
+
+// ---------------------------------------------------------------------------
+// The four UDP/TCP paths a packet can take from an app into the OS (see
+// README §2).  AetherNet can sit on each of them; `activeLanes` below records
+// which ones are actually running for the current target.
+// ---------------------------------------------------------------------------
+typedef enum : uint8_t {
+    // P1 — BSD socket syscalls (send/sendto/sendmsg/write …).  In-process
+    //      hooks inside the target; needs dylib injection to succeed.
+    AetherLaneBSDSocket     = (1u << 0),
+    // P2 — Network.framework / NSURLSession (libnetwork.dylib, nw_connection_*).
+    //      In-process hooks; this is the default path for every app since iOS 12
+    //      and the one a naive send()/recv() hook completely misses.
+    AetherLaneLibnetwork    = (1u << 1),
+    // P3 — the kernel tap: /dev/bpf on the interface the packets actually leave
+    //      on.  Works without any injection and sees BOTH P1 and P2 traffic,
+    //      because everything converges on the interface.
+    AetherLaneKernelTap     = (1u << 2),
+    // Enforcement only (no packet copies): PF/dummynet rules + SIGSTOP freeze.
+    AetherLaneShaper        = (1u << 3)
+} AetherCaptureLane;
+
+typedef enum : uint8_t {
+    AetherMethodNone         = 0, // nothing running
+    AetherMethodInProcess    = 1, // dylib injected → BSD + libnetwork lanes
+    AetherMethodKernelTap    = 2, // BPF tap only (observe, no control)
+    AetherMethodShaper       = 3, // PF / freeze only (control, no visibility)
+    AetherMethodTapAndShaper = 4, // BPF + PF/freeze
+    AetherMethodFull         = 5  // in-process hooks + BPF (+ shaper on demand)
+} AetherCaptureMethod;
 
 typedef enum : uint8_t {
     AetherPresetCustom      = 0,
@@ -155,6 +192,14 @@ typedef struct __attribute__((aligned(64))) {
     _Atomic(uint32_t) dbgBtnY;               // floating button center y (window coords)
     _Atomic(uint32_t) dbgRing[8];            // last 4 Began raw points (x,y,x,y,…)
     _Atomic(uint32_t) daemonBuild;           // build number of the running HUD daemon
+    // Tap arbitration: the HUD daemon receives raw digitizer events, so a single
+    // physical tap is seen BOTH by the floating button and by whatever the app
+    // happens to show underneath it — including its own "Remove Floating
+    // Button".  The daemon records the taps it consumed (time + screen point)
+    // and the app ignores a button press that came from the same gesture.
+    _Atomic(uint64_t) hudTapConsumedMs;
+    _Atomic(int32_t)  hudTapConsumedX;
+    _Atomic(int32_t)  hudTapConsumedY;
 
     // --- Live L4 Telemetry Counters (Updated by Injected Dylib & Socket Monitor) ---
     _Atomic(uint32_t) activeTCPSockets;
@@ -171,13 +216,56 @@ typedef struct __attribute__((aligned(64))) {
     _Atomic(uint32_t) currentTXRateBps;
     _Atomic(uint32_t) currentPacketRatePps;
 
-    // --- BPF Capture Telemetry (root engine fallback) ---
-    _Atomic(uint64_t) totalBPFPacketsRX;
-    _Atomic(uint64_t) totalBPFPacketsTX;
+    // --- Kernel tap (BPF) telemetry + lane bookkeeping (v4) ---
+    _Atomic(uint32_t) activeLanes;         // AetherCaptureLane bitmask actually running
+    _Atomic(uint32_t) availableLanes;      // …and what this device supports
+    _Atomic(uint8_t)  freezeActive;        // target is SIGSTOPped by the shaper
+    _Atomic(uint64_t) kernelTapPacketsRX;
+    _Atomic(uint64_t) kernelTapPacketsTX;
+    _Atomic(uint64_t) kernelTapBytesRX;
+    _Atomic(uint64_t) kernelTapBytesTX;
+    _Atomic(uint32_t) kernelTapFlows;
+    _Atomic(uint32_t) kernelTapDropped;   // kernel buffer overruns (BIOCGSTATS)
+    char              kernelTapInterface[32];
+    char              engineStatus[192];  // one-line explanation for the UI
+
+    // --- Kernel tap control + diagnostics (v4.0.2) -------------------------
+    // The UI app runs as uid 501 and therefore CANNOT signal the root `-bftap`
+    // helper it spawned (kill() to a uid-0 process returns EPERM), so the stop
+    // request travels through shared memory instead.
+    _Atomic(uint32_t) tapStopRequest;      // 1 = parent asks the helper to exit
+    _Atomic(uint32_t) tapHelperPid;        // pid of the running helper (0 = in-process)
+    _Atomic(uint32_t) tapFramesSeen;       // link-layer records walked
+    _Atomic(uint32_t) tapFramesIP;         // …that parsed as IPv4/IPv6 TCP+UDP
+    _Atomic(uint32_t) tapFramesMatched;    // …attributed to the target
+    // The lanes can run in EITHER process (the app starts them when the toggle
+    // comes from the UI, the daemon when it comes from the floating button).
+    // Whoever restarts must know whether a live owner already exists — starting
+    // a second tap would double count every packet in these shared counters.
+    _Atomic(pid_t)    laneOwnerPID;        // process running the lanes, 0 = none
+    _Atomic(uint32_t) tapStatsLogged;      // last statistics line (epoch-ish ms)
 
     // --- Snapshot of Active L4 Connections in Target PID ---
     uint32_t          socketEntryCount;
     AetherSocketEntry activeSockets[AETHER_MAX_TRACKED_SOCKETS];
+
+    // --- Freeze opt-in (v4.1.3) ---------------------------------------------
+    // SIGSTOPping the target is the ONLY enforcement primitive iOS leaves when
+    // there is neither pfctl/dnctl nor an in-process hook — but a stopped
+    // process is a FROZEN APP: no rendering, no FPS, and nothing left for the
+    // BPF tap to capture.  Hold/Drop reach it implicitly, so it must never fire
+    // on its own: default 0, and AetherShaperApply() only freezes when the
+    // user switched this on explicitly.
+    _Atomic(uint8_t)  allowFreeze;
+
+    // --- Ping simulation / lag switch (v4.1.5) ------------------------------
+    // There is no queue anywhere on this device to hold a packet for N ms (no
+    // pfctl, no dnctl, no in-process hook), so the only way to make a game's
+    // ping move is to stall the target itself: SIGSTOP for `lagSpikeMs`, then
+    // SIGCONT, repeated every `lagCycleMs` — a hardware lag switch in software.
+    // lagSpikeMs == 0 (the default) means never stall anything.
+    _Atomic(uint32_t) lagSpikeMs;         // length of one stall, 0 = off
+    _Atomic(uint32_t) lagCycleMs;         // period between two stalls
 } AetherSharedState;
 
 #ifdef __cplusplus
@@ -187,8 +275,29 @@ extern "C" {
 AetherSharedState *AetherGetSharedState(void);
 void AetherResetTelemetryForNewTarget(AetherSharedState *state, pid_t pid, const char *name, const char *bundleID, const char *execPath);
 
-// BPF capture thread — spawn for root-engine-only mode when dylib hooks unavailable
-void AetherStartBPFCaptureIfAvailable(void);
+// ---------------------------------------------------------------------------
+// Path-aware capture engine (Core/L4Engine)
+// ---------------------------------------------------------------------------
+
+/// Kernel tap lane (P3): opens /dev/bpfN, attaches to the interface(s) the
+/// target's traffic leaves on and counts/attributes every TCP+UDP packet.
+/// Needs root (persona) + no-sandbox.  Returns 0 on success.
+int  AetherKernelLaneStart(pid_t pid, bool primary, char *errBuf, size_t errBufLen);
+void AetherKernelLaneStop(void);
+bool AetherKernelLaneIsRunning(void);
+
+/// One-shot capability probe: opens a BPF device and immediately closes it so
+/// the UI can report whether the tap is usable on this device.
+bool AetherKernelLaneIsAvailable(void);
+
+/// Enforcement lane: PF/dummynet rules + SIGSTOP freeze, all executed through
+/// a short-lived root helper (posix_spawn persona) because the UI app runs as
+/// uid 501 and may not signal/pfctl other processes.
+int  AetherShaperApply(pid_t pid, char *errBuf, size_t errBufLen);
+int  AetherShaperFlush(char *errBuf, size_t errBufLen);
+int  AetherShaperFreeze(pid_t pid, bool freeze, char *errBuf, size_t errBufLen);
+/// Bitmask of the enforcement primitives present on this device.
+uint32_t AetherShaperCapabilities(void);
 
 #ifdef __cplusplus
 }

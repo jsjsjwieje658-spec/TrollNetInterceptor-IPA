@@ -191,6 +191,16 @@
 
     bool nextState = !aether_atomic_load(&state->interceptionActive);
     AetherLog(@"floating button TAP -> interception %s", nextState ? "ON" : "OFF");
+
+    // Remember that THIS gesture was consumed here: the same physical tap is
+    // also delivered to the app underneath, whose "Remove Floating Button" sit
+    // right below the overlay on some layouts (that is how the button used to
+    // disappear a few seconds after starting a capture).
+    CGPoint tapPoint = [recognizer locationInView:nil];
+    aether_atomic_store(&state->hudTapConsumedMs, (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0));
+    aether_atomic_store(&state->hudTapConsumedX, (int32_t)tapPoint.x);
+    aether_atomic_store(&state->hudTapConsumedY, (int32_t)tapPoint.y);
+
     [[AetherProcessManager sharedManager] setInterceptionActive:nextState];
 
     if (aether_atomic_load(&state->floatingHapticEnabled)) {

@@ -36,6 +36,12 @@ void AetherLogDaemonWithLevel(AetherLogLevel level, NSString *format, ...) NS_FO
 /// Synchronous variant — safe right before exit(0).
 void AetherLogDaemonSync(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 
+/// Async-signal-safe variant: no Objective-C, no malloc, no dispatch, just
+/// open/write/close.  This is the ONLY logger that may be called from a
+/// fatal-signal handler, which is exactly why it exists — every other path
+/// allocates, and a process that dies unannounced is undebuggable.
+void AetherLogRawSync(const char *message);
+
 /// Clear app log file (for use by the Log tab's Clear button).
 void AetherLogClear(void);
 

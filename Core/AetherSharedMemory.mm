@@ -13,7 +13,30 @@
 
 static AetherSharedState *gSharedState = NULL;
 
+// ---------------------------------------------------------------------------
+// Injector handoff.
+//
+// AetherGetSharedState() normally maps a file under /var/mobile/Library/Caches.
+// Two problems with that inside an *injected* payload:
+//   • App Store apps are sandboxed and cannot open that path;
+//   • even when they can, we would rather not depend on the filesystem.
+//
+// So the injector additionally maps the very same physical pages into the
+// target (mach_make_memory_entry_64 + mach_vm_map over the task port) and then
+// calls this setter through a remote thread.  Once adopted, the payload uses
+// the injected mapping instead of the file.
+// ---------------------------------------------------------------------------
+static AetherSharedState *gAdoptedState = NULL;
+
+extern "C" void AetherSharedStateAdopt(void *region) {
+    if (!region) return;
+    gAdoptedState = (AetherSharedState *)region;
+}
+
 extern "C" AetherSharedState *AetherGetSharedState(void) {
+    if (gAdoptedState != NULL) {
+        return gAdoptedState;
+    }
     if (gSharedState != NULL) {
         return gSharedState;
     }
@@ -48,7 +71,7 @@ extern "C" AetherSharedState *AetherGetSharedState(void) {
     if (gSharedState->magic != AETHER_SHM_MAGIC) {
         memset(gSharedState, 0, sizeof(AetherSharedState));
         gSharedState->magic = AETHER_SHM_MAGIC;
-        gSharedState->version = 240;
+        gSharedState->version = AETHER_BUILD_NUM;
 
         aether_atomic_store(&gSharedState->targetPID, 0);
         aether_atomic_store(&gSharedState->isInjected, false);
@@ -58,12 +81,15 @@ extern "C" AetherSharedState *AetherGetSharedState(void) {
         // Default Interception Settings
         aether_atomic_store(&gSharedState->direction, (uint8_t)AetherDirectionBoth);
         aether_atomic_store(&gSharedState->protocolFilter, (uint8_t)AetherProtoTCPAndUDP);
-        aether_atomic_store(&gSharedState->interceptMode, (uint8_t)AetherModeHoldQueue);
+        aether_atomic_store(&gSharedState->interceptMode, (uint8_t)AetherModeObserve);
         aether_atomic_store(&gSharedState->activePreset, (uint8_t)AetherPresetCustom);
+        aether_atomic_store(&gSharedState->allowFreeze, 0);   // never freeze by default
+        aether_atomic_store(&gSharedState->lagSpikeMs, 0);     // ping simulation off
+        aether_atomic_store(&gSharedState->lagCycleMs, 1000);
 
-        aether_atomic_store(&gSharedState->captureRatioPercent, 85);
-        aether_atomic_store(&gSharedState->downloadHoldPercent, 85);
-        aether_atomic_store(&gSharedState->uploadHoldPercent, 90);
+        aether_atomic_store(&gSharedState->captureRatioPercent, 100);
+        aether_atomic_store(&gSharedState->downloadHoldPercent, 100);
+        aether_atomic_store(&gSharedState->uploadHoldPercent, 100);
         aether_atomic_store(&gSharedState->simulatedLatencyMs, 120);
         aether_atomic_store(&gSharedState->simulatedJitterMs, 25);
         aether_atomic_store(&gSharedState->bandwidthLimitKbps, 0); // Unlimited
@@ -78,6 +104,22 @@ extern "C" AetherSharedState *AetherGetSharedState(void) {
         aether_atomic_store(&gSharedState->floatingHapticEnabled, true);
         aether_atomic_store(&gSharedState->floatingPosX, 310.0f);
         aether_atomic_store(&gSharedState->floatingPosY, 220.0f);
+    } else if (gSharedState->version < AETHER_BUILD_NUM) {
+        // Upgrade path.  Shared memory outlives the app (the HUD daemon keeps
+        // it alive), so a persisted setting from an older build keeps applying
+        // after an update: users who never touched "Intercept mode" stayed on
+        // the old default (Hold), which on a device without pfctl means the
+        // target gets SIGSTOPped for the whole session.  Migrate defaults that
+        // changed meaning; leave everything the user actually set alone.
+        // 4.1.3: a persisted Hold/Drop mode made the shaper SIGSTOP the target
+        // on devices without pfctl — the app visibly froze (no FPS) and the
+        // capture starved with it.  Reset both the mode and the new opt-in to
+        // the capture-only defaults; anything the user sets afterwards sticks.
+        if (gSharedState->version < 413U) {
+            aether_atomic_store(&gSharedState->interceptMode, (uint8_t)AetherModeObserve);
+            aether_atomic_store(&gSharedState->allowFreeze, 0);
+        }
+        gSharedState->version = AETHER_BUILD_NUM;
     }
 
     return gSharedState;
@@ -108,5 +150,14 @@ extern "C" void AetherResetTelemetryForNewTarget(AetherSharedState *state,
     aether_atomic_store(&state->currentRXRateBps, 0);
     aether_atomic_store(&state->currentTXRateBps, 0);
     aether_atomic_store(&state->currentPacketRatePps, 0);
+    aether_atomic_store(&state->kernelTapPacketsRX, 0);
+    aether_atomic_store(&state->kernelTapPacketsTX, 0);
+    aether_atomic_store(&state->kernelTapBytesRX, 0);
+    aether_atomic_store(&state->kernelTapBytesTX, 0);
+    aether_atomic_store(&state->kernelTapFlows, 0);
+    aether_atomic_store(&state->kernelTapDropped, 0);
+    aether_atomic_store(&state->activeLanes, 0);
+    aether_atomic_store(&state->freezeActive, 0);
+    if (state->engineStatus[0] != '\0') state->engineStatus[0] = '\0';
     state->socketEntryCount = 0;
 }

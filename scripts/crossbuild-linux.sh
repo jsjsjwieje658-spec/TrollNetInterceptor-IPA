@@ -34,11 +34,13 @@ COMMON_FLAGS="$TARGET $MINOS -isysroot $SDK -DAETHER_REAL_SDK=1 -I$ROOT/headers 
 MMFLAGS="$COMMON_FLAGS -x objective-c++ -std=gnu++17 -fobjc-arc -fobjc-weak"
 CFLAGS="$COMMON_FLAGS -x c -std=gnu11"
 
-# Module: libNetHookPayload.dylib (injected L4 hooks)
-DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherLog_dl.o")
+# Module: libNetHookPayload.dylib (injected L4 hooks — P1 BSD + P2 libnetwork)
+DYLIB_OBJS=("$OUT/NetHookPayload.o" "$OUT/fishhook.o" "$OUT/AetherLog_dl.o" \
+            "$OUT/AetherHookCore_dl.o" "$OUT/AetherPacketCore_dl.o")
 # Module: AetherNet executable (main dispatcher → app UI + HUD plugin mode)
 APP_OBJS=("$OUT/main.o" "$OUT/AetherSharedMemory.o" "$OUT/ProcessManager.o" \
-          "$OUT/MachInjector.o" "$OUT/NECPCapture.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
+          "$OUT/MachInjector.o" "$OUT/AetherKernelLane.o" "$OUT/AetherShaper.o" \
+          "$OUT/AetherPacketCore.o" "$OUT/AppTheme.o" "$OUT/HomeViewController.o" \
           "$OUT/SettingsViewController.o" "$OUT/LogViewController.o" "$OUT/AetherGoldButton.o" "$OUT/AetherLog.o")
 
 mkdir -p "$OUT" "$APP"
@@ -50,13 +52,17 @@ $CC $MMFLAGS -c "$ROOT/Core/AetherSharedMemory.mm" -o "$OUT/AetherSharedMemory_d
 $CC $CFLAGS   -c "$ROOT/Core/compiler_rt_shim.c"  -o "$OUT/compiler_rt_shim_dl.o" || exit 1
 DYLIB_OBJS+=("$OUT/AetherSharedMemory_dl.o" "$OUT/compiler_rt_shim_dl.o")
 $CC $MMFLAGS -DAETHER_LOG_STANDALONE -c "$ROOT/Core/AetherLog.mm" -o "$OUT/AetherLog_dl.o" || exit 1
+$CC $CFLAGS   -c "$ROOT/Payload/AetherHookCore.c"          -o "$OUT/AetherHookCore_dl.o"    || exit 1
+$CC $CFLAGS   -c "$ROOT/Core/L4Engine/AetherPacketCore.c"  -o "$OUT/AetherPacketCore_dl.o"  || exit 1
 
 echo "── [2/4] Compiling AetherNet executable (arm64)…"
 $CC $MMFLAGS -c "$ROOT/main.mm"                       -o "$OUT/main.o"                || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/AetherSharedMemory.mm"    -o "$OUT/AetherSharedMemory.o"  || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/ProcessManager.mm"        -o "$OUT/ProcessManager.o"      || exit 1
 $CC $MMFLAGS -c "$ROOT/Core/MachInjector.mm"          -o "$OUT/MachInjector.o"        || exit 1
-$CC $MMFLAGS -c "$ROOT/Core/NECPCapture.mm"           -o "$OUT/NECPCapture.o"         || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/L4Engine/AetherKernelLane.mm" -o "$OUT/AetherKernelLane.o"   || exit 1
+$CC $MMFLAGS -c "$ROOT/Core/L4Engine/AetherShaper.mm"     -o "$OUT/AetherShaper.o"       || exit 1
+$CC $CFLAGS  -c "$ROOT/Core/L4Engine/AetherPacketCore.c"  -o "$OUT/AetherPacketCore.o"   || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/FloatingToggleButton.mm"   -o "$OUT/FloatingToggleButton.o" || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/HUDMainWindow.mm"          -o "$OUT/HUDMainWindow.o"        || exit 1
 $CC $MMFLAGS -c "$ROOT/HUD/IOHIDEventKIF.m"           -o "$OUT/IOHIDEventKIF.o"        || exit 1
@@ -102,9 +108,9 @@ info = {
     "CFBundleInfoDictionaryVersion": "6.0",
     "CFBundleName": "AetherNet",
     "CFBundlePackageType": "APPL",
-    "CFBundleShortVersionString": "3.6.0",
+    "CFBundleShortVersionString": "4.1.5",
     "CFBundleSupportedPlatforms": ["iPhoneOS"],
-    "CFBundleVersion": "360",
+    "CFBundleVersion": "415",
     "DTPlatformName": "iphoneos",
     "DTPlatformVersion": "16.5",
     "DTSDKName": "iphoneos16.5",

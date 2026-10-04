@@ -47,84 +47,14 @@ int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t * __restrict, uid
 #define PROX_FDTYPE_SOCKET 2
 #endif
 
-struct proc_fdinfo {
-    int32_t  proc_fd;
-    uint32_t proc_fdtype;
-};
-
-struct in_sockinfo {
-    int      insi_fport;
-    int      insi_lport;
-    uint64_t insi_gencnt;
-    uint32_t insi_flags;
-    uint32_t insi_flow;
-    uint8_t  insi_vflag; // INI_IPV4 = 0x1, INI_IPV6 = 0x2
-    uint8_t  insi_ip_ttl;
-    uint32_t rfu_1;
-    union {
-        struct in_addr  ina_46;
-        struct in6_addr ina_6;
-    } insi_faddr;
-    union {
-        struct in_addr  ina_46;
-        struct in6_addr ina_6;
-    } insi_laddr;
-};
-
-struct tcp_sockinfo {
-    struct in_sockinfo tcpsi_ini;
-    int                tcpsi_state;
-    int                tcpsi_timer[4];
-    int                tcpsi_mss;
-    uint32_t           tcpsi_flags;
-    uint32_t           rfu_1;
-    uint64_t           tcpsi_tp;
-};
-
-struct sockbuf_info {
-    uint32_t sbi_cc;
-    uint32_t sbi_hiwat;
-    uint32_t sbi_mbcnt;
-    uint32_t sbi_mbmax;
-    uint32_t sbi_lowat;
-    short    sbi_flags;
-    short    sbi_timeo;
-};
-
-struct socket_info_layout {
-    uint64_t soi_so;
-    uint64_t soi_pcb;
-    int      soi_type;     // SOCK_STREAM (1), SOCK_DGRAM (2)
-    int      soi_protocol; // IPPROTO_TCP (6), IPPROTO_UDP (17)
-    int      soi_family;   // AF_INET (2), AF_INET6 (30)
-    short    soi_options;
-    short    soi_linger;
-    short    soi_state;
-    short    soi_qlen;
-    short    soi_incqlen;
-    short    soi_qlimit;
-    short    soi_timeo;
-    u_short  soi_error;
-    uint32_t soi_oobmark;
-    struct sockbuf_info soi_rcv;
-    struct sockbuf_info soi_snd;
-    int      soi_kind;
-    uint32_t rfu_1;
-    union {
-        struct in_sockinfo  pri_in;
-        struct tcp_sockinfo pri_tcp;
-    } soi_proto;
-};
-
-// Layout-compatible with XNU's struct socket_fdinfo; only the psi member is read.
-struct aether_socket_fdinfo {
-    uint32_t fi_openflags;
-    uint32_t fi_status;
-    off_t    fi_offset;
-    int32_t  fi_type;
-    uint32_t fi_guardflags;
-    struct socket_info_layout psi;
-};
+// The XNU proc_info structures live in their own header now: they are plain C
+// (so tests/host can static-assert the offsets on the build host) and they are
+// transcribed verbatim from XNU bsd/sys/proc_info.h (xnu-8792 = iOS 16.x).
+// 4.0.0 declared them inline here and dropped `struct socket_info.soi_stat`,
+// which shifted every field: proc_pidfdinfo() then returned a size the caller
+// did not recognise and every socket was skipped, so the kernel tap always
+// reported "target has no INET TCP/UDP socket yet".
+#include "AetherProcInfoLayout.h"
 
 int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
@@ -141,6 +71,29 @@ kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mac
 kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 kern_return_t mach_vm_write(vm_map_t target_task, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t dataCnt);
 kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+
+// <mach/mach_vm.h> is deliberately marked unsupported in the iOS SDK, so the
+// two calls we need for the shared-state handoff are declared here.  The
+// prototypes match XNU exactly; on arm64 all the typedefs involved are
+// pointer- or uint64_t-sized, so the ABI is identical.
+kern_return_t mach_vm_map(vm_map_t target_task,
+                          mach_vm_address_t *address,
+                          mach_vm_size_t size,
+                          mach_vm_address_t mask,
+                          int flags,
+                          mach_port_t memory_entry,
+                          uint64_t offset,
+                          boolean_t copy,
+                          vm_prot_t cur_protection,
+                          vm_prot_t max_protection,
+                          vm_inherit_t inheritance);
+
+// mach_make_memory_entry_64() IS declared by the iOS SDK (<mach/vm_map.h>):
+//     kern_return_t mach_make_memory_entry_64(vm_map_t target_task,
+//         memory_object_size_t *size, memory_object_offset_t offset,
+//         vm_prot_t permission, mach_port_t *object_handle,
+//         mem_entry_name_port_t parent_entry);
+// — note the last parameter is a port, not a pointer to one.
 
 // ============================================================================
 // 4. SpringBoard / BackBoard / GraphicsServices HUD Window Hosting SPI

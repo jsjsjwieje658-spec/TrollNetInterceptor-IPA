@@ -87,19 +87,20 @@
 	<true/>
 
 	<!-- =====================================================================
-	     5. LOW-LEVEL NETWORK L4 (TCP/UDP) SOCKET & NECP / PF INTERCEPTION
-	     Allows inspecting per-PID sockets, NECP policies, and packet shaping
+	     5. L4 (TCP/UDP) CAPTURE & SHAPING — v4.0 note
+	     The v3.x "NECP capture tier" is GONE: NECP is a policy engine
+	     (necp_match_policy / necp_client_action), not a tap, and every
+	     privileged action is entitlement-gated on iOS.  The v4 engine needs no
+	     network entitlement at all:
+	       • /dev/bpf (P3)      — root only, and we ARE root via persona spawn
+	       • pfctl / dnctl (P4) — root only, same story
+	       • proc_pidfdinfo     — root only, same story
+	     The five keys that used to sit here (necp.match, necp.policies,
+	     networkd.modify_settings, networkextension.configuration,
+	     private.network.socket-delegate) belonged to dead designs (NECP tap,
+	     NE providers — MDM/supervised only) and were removed rather than left
+	     as false declarations in the signature.
 	     ===================================================================== -->
-	<key>com.apple.private.network.socket-delegate</key>
-	<true/>
-	<key>com.apple.private.necp.match</key>
-	<true/>
-	<key>com.apple.private.necp.policies</key>
-	<true/>
-	<key>com.apple.networkd.modify_settings</key>
-	<true/>
-	<key>com.apple.private.networkextension.configuration</key>
-	<true/>
 
 	<!-- =====================================================================
 	     6. PREFERENCES & IPC

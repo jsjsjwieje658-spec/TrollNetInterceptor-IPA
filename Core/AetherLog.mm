@@ -5,6 +5,12 @@
 
 #import <Foundation/Foundation.h>
 #import "AetherLog.h"
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/time.h>
+#include <stdio.h>
+#include <string.h>
 
 // Defined in main.mm — set to YES in the -hud daemon branch.
 // When compiled INTO the standalone hook payload (AETHER_LOG_STANDALONE),
@@ -44,9 +50,21 @@ static void AetherLogAppendToFile(NSString *path, NSString *line)
     static const NSUInteger kMaxLogLines  = 4000;
     static const NSUInteger kTrimToLines  = 2000;
 
-    // Always append — O_APPEND is atomic for small writes on local FS
+    // Always append — O_APPEND is atomic for small writes on local FS.
     FILE *f = fopen(path.fileSystemRepresentation, "a");
-    if (!f) return;
+    if (!f) {
+        // This happens constantly for the hook payload inside an App Store
+        // app: the target is sandboxed and /var/mobile/Library is off limits.
+        // Fall back to the system log so the capture is still observable
+        // (Console.app / `log stream`) instead of silently disappearing.
+        static BOOL warned = NO;
+        if (!warned) {
+            warned = YES;
+            NSLog(@"[AetherNet] log file unavailable (%@) — using NSLog", path);
+        }
+        NSLog(@"%@", line);
+        return;
+    }
     fputs(line.UTF8String, f);
     fputc('\n', f);
     fflush(f);
@@ -89,15 +107,26 @@ static void AetherLogAppendToFile(NSString *path, NSString *line)
 }
 
 // Unified timestamp formatter, shared across all log functions.
+//
+// This used to be a single shared NSDateFormatter.  NSDateFormatter is NOT
+// thread-safe, and this function runs on the CALLER's thread — the main
+// thread, the BPF tap thread and the tap liveness thread all log at the same
+// time, and two of them calling -stringFromDate: on the same formatter is a
+// SIGSEGV.  That crash is what killed every HUD daemon within seconds of the
+// tap starting (4.0.8/4.1.0 logs: "[pid ...] FATAL signal 11").  localtime_r
+// is reentrant, so this version has no shared state at all.
 static NSString *AetherLogCurrentTimestamp(void)
 {
-    static NSDateFormatter *fmt = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        [fmt setDateFormat:@"HH:mm:ss.SSS"];
-    });
-    return [fmt stringFromDate:[NSDate date]];
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tmnow;
+    localtime_r(&tv.tv_sec, &tmnow);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tmnow.tm_hour, tmnow.tm_min, tmnow.tm_sec,
+             (int)(tv.tv_usec / 1000));
+    return [NSString stringWithUTF8String:buf];
 }
 
 void AetherLog(NSString *format, ...)
@@ -121,11 +150,15 @@ void AetherLog(NSString *format, ...)
 // Initialize log paths lazily (called from both AetherLog and AetherLogDaemon)
 static void ensureLogQueue(void)
 {
-    if (!gLogQueue) {
+    // dispatch_once, not "if (!gLogQueue)": the tap thread and the main thread
+    // can reach this simultaneously, and two queues would mean two writers
+    // interleaved in one file (and one of them leaked).
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         gLogQueue = dispatch_queue_create("com.aethernet.log", DISPATCH_QUEUE_SERIAL);
         gAppLogPath = AetherLogComputeAppPath();
         gDaemonLogPath = @"/var/mobile/Library/aethernet-hud.log";
-    }
+    });
 }
 
 void AetherLogWithLevel(AetherLogLevel level, NSString *format, ...)
@@ -229,6 +262,38 @@ NSString * _Nullable AetherLogAppPath(void)
 {
     ensureLogQueue();
     return gAppLogPath;
+}
+
+// ---------------------------------------------------------------------------
+// Async-signal-safe logger.
+//
+// A process that is killed by jetsam, by the iOS main-thread watchdog
+// (0x8badf00d) or by a fatal signal leaves NO trace: everything else in this
+// file allocates or hops to a dispatch queue, and neither is legal inside a
+// signal handler.  This writes one line with open()/write()/close() and
+// nothing else, so the moment of death is still on disk when we look.
+// ---------------------------------------------------------------------------
+void AetherLogRawSync(const char *message)
+{
+    static const char *kPath = "/var/mobile/Library/aethernet-hud.log";
+    char   line[512];
+    time_t now = time(NULL);
+    struct tm tmnow;
+    localtime_r(&now, &tmnow);
+
+    int n = snprintf(line, sizeof(line),
+                     "[%04d-%02d-%02d %02d:%02d:%02d] [hud] %s\n",
+                     tmnow.tm_year + 1900, tmnow.tm_mon + 1, tmnow.tm_mday,
+                     tmnow.tm_hour, tmnow.tm_min, tmnow.tm_sec,
+                     message ? message : "");
+    if (n <= 0) return;
+    if ((size_t)n > sizeof(line)) n = (int)sizeof(line);
+
+    int fd = open(kPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) { write(2, line, (size_t)n); return; }
+    ssize_t written = write(fd, line, (size_t)n);
+    (void)written;
+    close(fd);
 }
 
 void AetherLogClear(void)

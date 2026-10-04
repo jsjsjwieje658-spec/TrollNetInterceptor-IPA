@@ -14,12 +14,17 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import "../Core/ProcessManager.h"
 #import <objc/runtime.h>
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/ucontext.h>
+#include <pthread.h>
+#import "../Core/L4Engine/AetherKernelLane.h"
 #include <dlfcn.h>
 #include <sys/utsname.h>
 #include <dirent.h>
@@ -523,6 +528,81 @@ static void AetherLoadPrivateFrameworks(void)
     dlopen("/System/Library/PrivateFrameworks/UIToolkit.framework/UIToolkit", RTLD_LAZY);
 }
 
+#pragma mark - Death reporting
+
+// The HUD daemon dies without a word: jetsam, the iOS main-thread watchdog
+// (0x8badf00d) and a fatal signal all arrive as a SIGKILL-equivalent with no
+// log line, which is why "the button just disappeared" was undebuggable.
+// These handlers leave a note on the way out.  They may only use
+// AetherLogRawSync() — signal handlers cannot allocate, take locks or touch
+// Objective-C.
+static void AetherHUDFatalSignalHandler(int sig, siginfo_t *info, void *uap)
+{
+    (void)info;
+    // pc + lr + the runtime address of one symbol we know (AetherLogRawSync)
+    // is enough to work out the slide and locate the crash in the binary
+    // without a device-side crash report: pc - (base - static_base).
+    ucontext_t *uc = (ucontext_t *)uap;
+    unsigned long long pc = 0, lr = 0;
+    if (uc) {
+#if defined(__arm64__) || defined(__aarch64__)
+        pc = (unsigned long long)uc->uc_mcontext->__ss.__pc;
+        lr = (unsigned long long)uc->uc_mcontext->__ss.__lr;
+#endif
+    }
+    pthread_t self  = pthread_self();
+    pthread_t tapT  = (pthread_t)AetherKernelLaneThread();
+    const char *who = (tapT && pthread_equal(self, tapT)) ? "tap"
+                    : pthread_main_np() ? "main" : "other";
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "[pid %d] FATAL signal %d (%s) pc=0x%llx lr=0x%llx base=0x%llx "
+             "phase=%d thread=%s - HUD daemon dying",
+             (int)getpid(), sig,
+             (sig == SIGSEGV) ? "SIGSEGV" :
+             (sig == SIGBUS)  ? "SIGBUS"  :
+             (sig == SIGABRT) ? "SIGABRT" :
+             (sig == SIGILL)  ? "SIGILL"  :
+             (sig == SIGFPE)  ? "SIGFPE"  :
+             (sig == SIGKILL) ? "SIGKILL" : "signal",
+             pc, lr, (unsigned long long)(uintptr_t)&AetherLogRawSync,
+             AetherKernelLanePhase(), who);
+    AetherLogRawSync(msg);
+    // SA_RESETHAND already restored SIG_DFL: re-raise so the process dies the
+    // way it would have died, with the right exit status for the watchdog.
+    raise(sig);
+}
+
+static void AetherHUDUncaughtExceptionHandler(NSException *exception)
+{
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "[pid %d] FATAL uncaught %s: %s - HUD daemon dying",
+             (int)getpid(),
+             exception.name ? [exception.name UTF8String] : "exception",
+             exception.reason ? [exception.reason UTF8String] : "(no reason)");
+    AetherLogRawSync(msg);
+}
+
+static void AetherHUDInstallDeathReporting(void)
+{
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = AetherHUDFatalSignalHandler;
+    sa.sa_flags     = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    NSSetUncaughtExceptionHandler(AetherHUDUncaughtExceptionHandler);
+}
+
 #pragma mark - HUD lifecycle
 
 int HUDMain(int argc, char *argv[])
@@ -535,6 +615,10 @@ int HUDMain(int argc, char *argv[])
         if (strcmp(argv[1], "-hud") == 0) {
             pid_t pid = getpid();
 
+            // Installed before anything else can go wrong: from here on even a
+            // crash leaves a line in the log instead of a silent disappearance.
+            AetherHUDInstallDeathReporting();
+
             // Single-instance guard: two daemons mean two overlapping buttons
             // and duplicated HID callbacks. The second instance must exit.
             {
@@ -544,7 +628,10 @@ int HUDMain(int argc, char *argv[])
                 pid_t oldPid = (pid_t)oldPidStr.intValue;
                 BOOL otherAlive = NO;
                 if (oldPid > 0 && oldPid != pid) {
-                    if (kill(oldPid, 0) == 0 || errno == EPERM) otherAlive = YES;
+                    // 1 == really running.  2 == zombie, i.e. a previous daemon
+                    // that already exited; its pid is still signallable, and
+                    // believing it is what stopped every respawn from starting.
+                    if (AetherPIDStateOf(oldPid) == 1) otherAlive = YES;
                 }
                 AetherSharedState *pre = AetherGetSharedState();
                 if (!otherAlive && pre) {
@@ -569,6 +656,32 @@ int HUDMain(int argc, char *argv[])
             AetherSharedState *state = AetherGetSharedState();
             if (state) {
                 aether_atomic_store(&state->hudVisible, true);
+            }
+
+            // Self-healing: when the lanes live in THIS process, a daemon
+            // restart (update, respring, silent kill) ended the capture while
+            // the UI still claimed to be capturing.  Resume it — but only if no
+            // other process is still running them, or every packet would be
+            // counted twice.
+            if (state) {
+                pid_t livePID = aether_atomic_load(&state->targetPID);
+                pid_t owner   = aether_atomic_load(&state->laneOwnerPID);
+                BOOL ownerAlive = (owner != 0) && (kill(owner, 0) == 0 || errno == EPERM);
+                if (livePID > 0 && aether_atomic_load(&state->interceptionActive)) {
+                    if (ownerAlive && owner != getpid()) {
+                        AetherLog(@"[pid %d] capture already owned by pid %d — not starting a "
+                                  @"second tap (it would double count)", pid, owner);
+                    } else {
+                        AetherLog(@"[pid %d] resuming live capture session for pid %d after restart",
+                                  pid, livePID);
+                        // NOT on this thread and NOT now: the lane start probes
+                        // the device and the BPF tap for seconds, and doing
+                        // that here blocks the main thread before the run loop
+                        // even exists — the classic 0x8badf00d kill.  Wait for
+                        // the UI to be up, then do it in the background.
+                        [[AetherProcessManager sharedManager] resumeCaptureForPID:livePID];
+                    }
+                }
             }
 
             AetherLoadPrivateFrameworks();
@@ -624,6 +737,7 @@ int HUDMain(int argc, char *argv[])
                                      dispatch_get_main_queue(),
                                      ^(int token) {
                 notify_cancel(token);
+                AetherLogDaemonSync(@"[pid %d] HUD daemon exiting (SpringBoard relaunched)", pid);
                 kill(pid, SIGKILL);
             });
 

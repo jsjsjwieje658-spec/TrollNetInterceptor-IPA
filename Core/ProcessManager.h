@@ -38,11 +38,22 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)injectIntoProcess:(AetherProcessInfo *)processInfo
                 error:(NSError * _Nullable * _Nullable)error;
 
-/// Starts NECP kernel-level packet capture (Tier 0) — no injection required
-- (BOOL)startNECPCaptureForPID:(pid_t)pid error:(NSError * _Nullable * _Nullable)error;
+/// Starts the P3 kernel tap (/dev/bpf).  `primary` marks it as the only
+/// source of truth for the shared traffic counters.
+- (BOOL)startKernelTapForPID:(pid_t)pid primary:(BOOL)primary
+                       error:(NSError * _Nullable * _Nullable)error;
 
-/// Stops NECP capture
-- (void)stopNECPCapture;
+/// Stops the P3 kernel tap
+- (void)stopKernelTap;
+
+/// Probes what this device can actually do and stores it in ->availableLanes
+- (uint32_t)probeAvailableLanes;
+
+/// Starts every lane the device supports for the current target
+- (void)startCaptureLanesForPID:(pid_t)targetPID;
+
+/// Stops every lane and releases frozen targets
+- (void)stopCaptureLanes;
 
 /// Detaches hooks and flushes held packet queues
 - (void)detachFromCurrentProcess;
@@ -50,9 +61,23 @@ NS_ASSUME_NONNULL_BEGIN
 /// Spawns or terminates the global root Floating HUD Button daemon
 - (void)setGlobalFloatingHUDEnabled:(BOOL)enabled;
 - (BOOL)isGlobalFloatingHUDRunning;
+/// Supervises the HUD daemon: while the user wants the floating button, this
+/// respawns it when it dies without a log line (jetsam / SpringBoard relaunch).
+/// Process liveness that knows about zombies: 0 = gone, 1 = alive,
+/// 2 = exited but not reaped (still visible to kill(), but not running).
+int AetherPIDStateOf(pid_t pid);
+
+- (void)startHUDWatchdog;
+/// Reap the HUD daemon if it is our child and log how it died.
+- (void)reapHUDChild;
+/// SIGKILL the HUD through a short-lived root copy of ourselves.
+- (void)killHUDProcess;
 
 /// Toggles active packet interception (Play ▶ <-> Pause ⏸)
 - (void)setInterceptionActive:(BOOL)active;
+/// Restart the lanes for `pid` after a daemon restart (deferred, lane-queue
+/// serialised, cancelled if interception was switched off in the meantime).
+- (void)resumeCaptureForPID:(pid_t)pid;
 
 @end
 

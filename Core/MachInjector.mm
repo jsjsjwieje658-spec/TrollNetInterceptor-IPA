@@ -1,52 +1,227 @@
 //
 //  MachInjector.mm
-//  AetherNet — Mach Task Remote Dylib Injector & Root PF/Dummynet Shaper
+//  AetherNet — remote dylib injection + shared-state handoff
+//
+//  Injection is a two-step job:
+//
+//   1. dlopen() the payload inside the target through a remote Mach thread.
+//   2. Hand the target a *mapping* of our shared state.  The payload can
+//      usually not open /var/mobile/Library/Caches/… itself (App Store apps are
+//      sandboxed), so we map the very pages we are already using into the
+//      target with mach_make_memory_entry_64 + mach_vm_map, then call
+//      AetherSharedStateAdopt() there with a second remote thread.
+//
+//  Step 2 is best-effort: when it fails (older kernels, hardened targets) the
+//  payload falls back to opening the file itself, and when that fails too the
+//  payload stays dormant instead of misbehaving.
 //
 
 #import <Foundation/Foundation.h>
+
 #include <mach/mach.h>
-#include <signal.h>
-#include <errno.h>
-#include "../Core/AetherLog.h"
+#include <mach/task_info.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <spawn.h>
-#include <sys/wait.h>
-#include <sys/types.h>
-#include <sys/param.h>
-#include <sys/time.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <stdlib.h>
-#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+#include "../Core/AetherLog.h"
 #include "../headers/AetherNetShared.h"
 #include "../headers/PrivateSystemSPI.h"
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 extern "C" char **environ;
 
-// ============================================================================
-// 1. Mach Remote Dylib Injection via task_for_pid()
-//    Requires: task_for_pid-allow, com.apple.system-task-ports
-// ============================================================================
-extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *errBuf, size_t errBufLen) {
-    if (pid <= 0 || !dylibPath) return -1;
+// ===========================================================================
+// 0. Remote-thread helper
+// ===========================================================================
+static int AetherRemoteCall(mach_port_t task,
+                            uint64_t functionAddress,
+                            uint64_t arg0,
+                            char *errBuf, size_t errBufLen) {
+    mach_vm_address_t remoteStack = 0;
+    mach_vm_size_t    stackSize   = 0x8000;
+    kern_return_t kr = mach_vm_allocate(task, &remoteStack, stackSize, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        snprintf(errBuf, errBufLen, "mach_vm_allocate(stack) failed: 0x%x", kr);
+        return -1;
+    }
+
+#if defined(__arm64__) || defined(__aarch64__)
+    arm_thread_state64_t state;
+    memset(&state, 0, sizeof(state));
+    state.__x[0] = arg0;
+    state.__sp   = (uint64_t)(remoteStack + (stackSize / 2));
+    state.__pc   = functionAddress;
+
+    thread_act_t thread = MACH_PORT_NULL;
+    kr = thread_create_running(task, ARM_THREAD_STATE64,
+                               (thread_state_t)&state, ARM_THREAD_STATE64_COUNT, &thread);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(thread)) {
+        snprintf(errBuf, errBufLen, "thread_create_running failed: 0x%x", kr);
+        mach_vm_deallocate(task, remoteStack, stackSize);
+        return -2;
+    }
+    mach_port_deallocate(mach_task_self(), thread);
+    mach_vm_deallocate(task, remoteStack, stackSize);
+    return 0;
+#else
+    (void)functionAddress; (void)arg0; (void)task;
+    snprintf(errBuf, errBufLen, "remote call unsupported on this architecture");
+    mach_vm_deallocate(task, remoteStack, stackSize);
+    return -3;
+#endif
+}
+
+// ===========================================================================
+// 1. Locating a symbol inside the copy of the dylib we just dlopen'd remotely
+// ===========================================================================
+
+// Minimal mirror of <mach-o/dyld_images.h> — we only read the first fields.
+#ifndef _MACH_O_DYLD_IMAGES_
+struct aether_dyld_all_image_infos {
+    uint32_t version;
+    uint32_t infoArrayCount;
+    uint64_t infoArray;          // struct dyld_image_info *
+    uint64_t notification;
+    uint64_t processDetachedFromSharedRegion;
+    uint64_t libSystemInitialized;
+    uint64_t dyldImageLoadAddress;
+};
+#endif
+
+/// Find the load address of `pathSuffix` inside `task`.
+static uint64_t AetherRemoteImageAddress(mach_port_t task, const char *pathSuffix) {
+    struct task_dyld_info info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    kern_return_t kr = task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &count);
+    if (kr != KERN_SUCCESS || info.all_image_info_addr == 0) return 0;
+
+    struct aether_dyld_all_image_infos all;
+    memset(&all, 0, sizeof(all));
+    mach_vm_size_t outSize = 0;
+    kr = mach_vm_read_overwrite(task, (mach_vm_address_t)info.all_image_info_addr,
+                                sizeof(all), (mach_vm_address_t)&all, &outSize);
+    if (kr != KERN_SUCCESS || all.infoArray == 0) return 0;
+
+    uint32_t maxImages = all.infoArrayCount > 512 ? 512 : all.infoArrayCount;
+    for (uint32_t i = 0; i < maxImages; i++) {
+        uint64_t entryAddr = all.infoArray + (uint64_t)i * 24ull;
+        uint64_t entry[3] = { 0, 0, 0 };
+        outSize = 0;
+        kr = mach_vm_read_overwrite(task, (mach_vm_address_t)entryAddr,
+                                    sizeof(entry), (mach_vm_address_t)entry, &outSize);
+        if (kr != KERN_SUCCESS) continue;
+        if (entry[1] == 0) continue;
+
+        char path[PATH_MAX];
+        memset(path, 0, sizeof(path));
+        outSize = 0;
+        kr = mach_vm_read_overwrite(task, (mach_vm_address_t)entry[1],
+                                    sizeof(path) - 1, (mach_vm_address_t)path, &outSize);
+        if (kr != KERN_SUCCESS) continue;
+        if (strstr(path, pathSuffix) != NULL) {
+            return entry[0];
+        }
+    }
+    return 0;
+}
+
+/// Read the offset of `symbol` (without leading underscore) inside a Mach-O
+/// file, relative to its __TEXT segment.  Returns 0 when not found.
+static uint64_t AetherSymbolOffsetInFile(const char *filePath, const char *symbol) {
+    FILE *f = fopen(filePath, "rb");
+    if (!f) return 0;
+
+    struct mach_header_64 mh;
+    if (fread(&mh, 1, sizeof(mh), f) != sizeof(mh)) { fclose(f); return 0; }
+    if (mh.magic != MH_MAGIC_64 && mh.magic != MH_CIGAM_64) { fclose(f); return 0; }
+
+    uint64_t textVmaddr = 0;
+    uint32_t symOff = 0, nSyms = 0, strOff = 0, strSize = 0;
+
+    fseek(f, sizeof(mh), SEEK_SET);
+    for (uint32_t i = 0; i < mh.ncmds; i++) {
+        struct load_command lc;
+        long pos = ftell(f);
+        if (fread(&lc, 1, sizeof(lc), f) != sizeof(lc)) break;
+        fseek(f, pos, SEEK_SET);
+
+        if (lc.cmd == LC_SEGMENT_64) {
+            struct segment_command_64 seg;
+            if (fread(&seg, 1, sizeof(seg), f) == sizeof(seg)) {
+                if (strncmp(seg.segname, "__TEXT", 6) == 0) textVmaddr = seg.vmaddr;
+            }
+        } else if (lc.cmd == LC_SYMTAB) {
+            struct symtab_command st;
+            if (fread(&st, 1, sizeof(st), f) == sizeof(st)) {
+                symOff = st.symoff; nSyms = st.nsyms;
+                strOff = st.stroff; strSize = st.strsize;
+            }
+        }
+        fseek(f, pos + (long)lc.cmdsize, SEEK_SET);
+    }
+
+    if (!symOff || !nSyms || !strSize) { fclose(f); return 0; }
+
+    // String table
+    char *strtab = (char *)malloc(strSize + 1);
+    if (!strtab) { fclose(f); return 0; }
+    fseek(f, (long)strOff, SEEK_SET);
+    if (fread(strtab, 1, strSize, f) != strSize) { free(strtab); fclose(f); return 0; }
+    strtab[strSize] = '\0';
+
+    uint64_t result = 0;
+    fseek(f, (long)symOff, SEEK_SET);
+    for (uint32_t i = 0; i < nSyms; i++) {
+        struct nlist_64 nl;
+        if (fread(&nl, 1, sizeof(nl), f) != sizeof(nl)) break;
+        uint32_t idx = nl.n_un.n_strx;
+        if (idx == 0 || idx >= strSize) continue;
+        const char *name = strtab + idx;
+        if (name[0] == '_') name++;                    // Mach-O C symbol prefix
+        if (strncmp(name, symbol, strlen(symbol) + 1) == 0) {
+            result = nl.n_value ? (nl.n_value - textVmaddr) : 0;
+            break;
+        }
+    }
+
+    free(strtab);
+    fclose(f);
+    return result;
+}
+
+// ===========================================================================
+// 2. Public: dlopen the payload inside the target
+// ===========================================================================
+extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath,
+                                        char *errBuf, size_t errBufLen) {
+    if (pid <= 0 || !dylibPath) {
+        snprintf(errBuf, errBufLen, "invalid arguments");
+        return -1;
+    }
 
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS || !MACH_PORT_VALID(task)) {
-        snprintf(errBuf, errBufLen, "task_for_pid(%d) failed: 0x%x (%s)", pid, kr, mach_error_string(kr));
+        snprintf(errBuf, errBufLen, "task_for_pid(%d) failed: 0x%x (%s)",
+                 pid, kr, mach_error_string(kr));
         return -2;
     }
 
-    // Allocate remote stack & path string in target process address space
-    mach_vm_size_t stackSize = 0x4000;
-    mach_vm_size_t pathAllocSize = 0x1000;
-    mach_vm_address_t remoteStack = 0;
-    mach_vm_address_t remotePath = 0;
+    mach_vm_size_t    stackSize     = 0x8000;
+    mach_vm_size_t    pathAllocSize = 0x1000;
+    mach_vm_address_t remoteStack   = 0;
+    mach_vm_address_t remotePath    = 0;
 
     kr = mach_vm_allocate(task, &remoteStack, stackSize, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
@@ -54,7 +229,6 @@ extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *
         snprintf(errBuf, errBufLen, "mach_vm_allocate(stack) failed: 0x%x", kr);
         return -3;
     }
-
     kr = mach_vm_allocate(task, &remotePath, pathAllocSize, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
         mach_vm_deallocate(task, remoteStack, stackSize);
@@ -63,8 +237,9 @@ extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *
         return -4;
     }
 
-    // Write dylib path into target task memory
-    kr = mach_vm_write(task, remotePath, (vm_offset_t)dylibPath, (mach_msg_type_number_t)(strlen(dylibPath) + 1));
+    size_t pathLen = strlen(dylibPath) + 1;
+    kr = mach_vm_write(task, remotePath, (vm_offset_t)dylibPath,
+                       (mach_msg_type_number_t)pathLen);
     if (kr != KERN_SUCCESS) {
         mach_vm_deallocate(task, remotePath, pathAllocSize);
         mach_vm_deallocate(task, remoteStack, stackSize);
@@ -72,261 +247,140 @@ extern "C" int AetherInjectDylibIntoPID(pid_t pid, const char *dylibPath, char *
         snprintf(errBuf, errBufLen, "mach_vm_write(dylibPath) failed: 0x%x", kr);
         return -5;
     }
-
     mach_vm_protect(task, remoteStack, stackSize, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     mach_vm_protect(task, remotePath, pathAllocSize, FALSE, VM_PROT_READ);
 
-    // Note: Because dyld shared cache is mapped at the same slide across processes
-    // from the same boot session on iOS, dlopen's address in libdyld.dylib matches.
     void *dlopenAddr = dlsym(RTLD_DEFAULT, "dlopen");
     if (!dlopenAddr) {
+        mach_vm_deallocate(task, remotePath, pathAllocSize);
+        mach_vm_deallocate(task, remoteStack, stackSize);
         mach_port_deallocate(mach_task_self(), task);
+        snprintf(errBuf, errBufLen, "cannot resolve dlopen locally");
         return -6;
     }
 
-#if defined(__arm64__) || defined(__aarch64__)
-    arm_thread_state64_t threadState;
-    memset(&threadState, 0, sizeof(threadState));
-
-    // x0 = const char *path (remotePath), x1 = int mode (RTLD_NOW = 0x2)
-    threadState.__x[0] = (uint64_t)remotePath;
-    threadState.__x[1] = (uint64_t)RTLD_NOW;
-    threadState.__sp   = (uint64_t)(remoteStack + (stackSize / 2));
-    threadState.__pc   = (uint64_t)dlopenAddr;
-
-    thread_act_t remoteThread = MACH_PORT_NULL;
-    kr = thread_create_running(
-        task,
-        ARM_THREAD_STATE64,
-        (thread_state_t)&threadState,
-        ARM_THREAD_STATE64_COUNT,
-        &remoteThread
-    );
-#else
-    kr = KERN_FAILURE;
-#endif
-
-    mach_port_deallocate(mach_task_self(), task);
+    int rc = AetherRemoteCall(task, (uint64_t)(uintptr_t)dlopenAddr,
+                              (uint64_t)remotePath, errBuf, errBufLen);
     mach_vm_deallocate(task, remotePath, pathAllocSize);
     mach_vm_deallocate(task, remoteStack, stackSize);
+    mach_port_deallocate(mach_task_self(), task);
+    if (rc != 0) return -7;
 
-    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(remoteThread)) {
-        snprintf(errBuf, errBufLen, "thread_create_running failed: 0x%x", kr);
+    AetherLogDaemon(@"[inject] dlopen(%s) dispatched into pid %d", dylibPath, pid);
+    return 0;
+}
+
+// ===========================================================================
+// 3. Public: map our shared state into the target and adopt it there
+// ===========================================================================
+extern "C" int AetherAdoptSharedStateIntoPID(pid_t pid, const char *dylibPath,
+                                             char *errBuf, size_t errBufLen) {
+    if (pid <= 0 || !dylibPath) {
+        snprintf(errBuf, errBufLen, "invalid arguments");
+        return -1;
+    }
+
+    AetherSharedState *local = AetherGetSharedState();
+    if (!local) {
+        snprintf(errBuf, errBufLen, "local shared state unavailable");
+        return -2;
+    }
+
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(task)) {
+        snprintf(errBuf, errBufLen, "task_for_pid(%d) failed: 0x%x", pid, kr);
+        return -3;
+    }
+
+    // Give the payload time to finish its constructor.
+    usleep(150000);
+
+    // 3.1 — where did our dylib land in the target?
+    const char *leaf = strrchr(dylibPath, '/');
+    leaf = leaf ? leaf + 1 : dylibPath;
+    uint64_t imageAddr = AetherRemoteImageAddress(task, leaf);
+    if (imageAddr == 0) {
+        // Second chance: the payload may not be in the dyld image list yet.
+        usleep(400000);
+        imageAddr = AetherRemoteImageAddress(task, leaf);
+    }
+    if (imageAddr == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        snprintf(errBuf, errBufLen, "dylib image not found in pid %d (dlopen failed?)", pid);
+        return -4;
+    }
+
+    uint64_t adoptOffset = AetherSymbolOffsetInFile(dylibPath, "AetherSharedStateAdopt");
+    if (adoptOffset == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        snprintf(errBuf, errBufLen, "symbol AetherSharedStateAdopt not found in payload");
+        return -5;
+    }
+
+    // 3.2 — map the pages we are using into the target
+    uint64_t regionAddr = (uint64_t)(uintptr_t)local;
+    uint64_t pageSize   = (uint64_t)getpagesize();
+    uint64_t pageMask   = pageSize - 1ull;
+    mach_vm_address_t pageAligned = (mach_vm_address_t)(regionAddr & ~pageMask);
+    uint64_t span = ((sizeof(AetherSharedState) +
+                     (size_t)(regionAddr - (uint64_t)pageAligned)) + pageMask) & ~pageMask;
+
+    uint64_t entrySize = span;
+    mach_port_t memEntry = MACH_PORT_NULL;
+    mach_port_t parentEntry = MACH_PORT_NULL;
+    kr = mach_make_memory_entry_64(mach_task_self(), &entrySize,
+                                   (memory_object_offset_t)pageAligned,
+                                   VM_PROT_READ | VM_PROT_WRITE,
+                                   &memEntry, parentEntry);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(memEntry)) {
+        mach_port_deallocate(mach_task_self(), task);
+        snprintf(errBuf, errBufLen, "mach_make_memory_entry_64 failed: 0x%x", kr);
+        return -6;
+    }
+
+    mach_vm_address_t remoteRegion = 0;
+    kr = mach_vm_map(task, &remoteRegion, (mach_vm_size_t)span, 0, VM_FLAGS_ANYWHERE,
+                     memEntry, 0, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE,
+                     VM_PROT_READ | VM_PROT_WRITE,
+                     VM_INHERIT_NONE);
+    mach_port_deallocate(mach_task_self(), memEntry);
+    if (parentEntry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), parentEntry);
+
+    if (kr != KERN_SUCCESS) {
+        mach_port_deallocate(mach_task_self(), task);
+        snprintf(errBuf, errBufLen, "mach_vm_map into pid %d failed: 0x%x", pid, kr);
         return -7;
     }
 
-    mach_port_deallocate(mach_task_self(), remoteThread);
+    // 3.3 — tell the payload about it
+    uint64_t remoteStateAddr = (uint64_t)remoteRegion +
+                               ((uint64_t)(uintptr_t)local - (uint64_t)pageAligned);
+    int rc = AetherRemoteCall(task, imageAddr + adoptOffset, remoteStateAddr,
+                              errBuf, errBufLen);
+    mach_port_deallocate(mach_task_self(), task);
+    if (rc != 0) {
+        mach_vm_deallocate(task, remoteRegion, (mach_vm_size_t)span);
+        return -8;
+    }
+
+    AetherLogDaemon(@"[inject] shared state handed to pid %d (remote=0x%llx, %llu bytes)",
+                    pid, (unsigned long long)remoteStateAddr, (unsigned long long)span);
     return 0;
 }
 
-// ============================================================================
-// 2. Root PF/Dummynet Traffic Shaper (Tier 2 Fallback)
-//    Uses pfctl anchor "com.apple/aethernet" with rules per tracked L4 socket.
-//    Requires: root (UID 0 via posix_spawnattr_set_persona_np) + pf anchor.
-// ============================================================================
-extern "C" int AetherApplyRootTrafficControl(pid_t pid, AetherSharedState *state) {
-    if (!state) return -1;
+/// Convenience: inject, then hand over the shared state.  Injection success is
+/// reported even when the handoff fails — the payload may still reach the file.
+extern "C" int AetherInjectAndArm(pid_t pid, const char *dylibPath,
+                                  char *errBuf, size_t errBufLen) {
+    int rc = AetherInjectDylibIntoPID(pid, dylibPath, errBuf, errBufLen);
+    if (rc != 0) return rc;
 
-    AetherInterceptMode mode = (AetherInterceptMode)aether_atomic_load(&state->interceptMode);
-    uint32_t ratio = aether_atomic_load(&state->captureRatioPercent);
-    uint32_t delayMs = aether_atomic_load(&state->simulatedLatencyMs);
-    uint32_t bwLimitKbps = aether_atomic_load(&state->bandwidthLimitKbps);
-    AetherTrafficDirection direction = (AetherTrafficDirection)aether_atomic_load(&state->direction);
-    AetherProtocolFilter protoFilter = (AetherProtocolFilter)aether_atomic_load(&state->protocolFilter);
-    bool active = aether_atomic_load(&state->interceptionActive);
-
-    NSMutableString *pfRule = [NSMutableString string];
-    [pfRule appendString:@"# AetherNet PF rules\n"];
-
-    if (active) {
-        NSString *protoStr = (protoFilter == AetherProtoUDPOnly) ? @"udp" :
-                             (protoFilter == AetherProtoTCPOnly) ? @"tcp" : @"{ tcp, udp }";
-
-        for (uint32_t i = 0; i < state->socketEntryCount; i++) {
-            AetherSocketEntry entry = state->activeSockets[i];
-            if (entry.localPort == 0) continue;
-
-            if (mode == AetherModeDropPacket || (mode == AetherModeHoldQueue && ratio >= 90)) {
-                if (direction == AetherDirectionBoth || direction == AetherDirectionDownload) {
-                    [pfRule appendFormat:@"block drop in quick proto %@ to any port %u probability %u%%\n",
-                     protoStr, entry.localPort, ratio];
-                }
-                if (direction == AetherDirectionBoth || direction == AetherDirectionUpload) {
-                    [pfRule appendFormat:@"block drop out quick proto %@ from any port %u probability %u%%\n",
-                     protoStr, entry.localPort, ratio];
-                }
-            }
-        }
-    }
-
-    NSString *confPath = @"/var/mobile/Library/Caches/com.aethernet.pf.conf";
-    [pfRule writeToFile:confPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-#if !TARGET_OS_SIMULATOR
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-    posix_spawnattr_set_persona_uid_np(&attr, 0);
-    posix_spawnattr_set_persona_gid_np(&attr, 0);
-#endif
-
-    pid_t child = 0;
-    if (active && pfRule.length > 0) {
-        const char *args[] = { "/sbin/pfctl", "-a", "com.apple/aethernet", "-f", [confPath UTF8String], NULL };
-        posix_spawn(&child, "/sbin/pfctl", NULL, &attr, (char **)args, environ);
-    } else {
-        const char *args[] = { "/sbin/pfctl", "-a", "com.apple/aethernet", "-F", "all", NULL };
-        posix_spawn(&child, "/sbin/pfctl", NULL, &attr, (char **)args, environ);
-    }
-
-    posix_spawnattr_destroy(&attr);
-    if (child > 0) {
-        int status = 0;
-        waitpid(child, &status, 0);
+    char adoptErr[256] = {0};
+    int arc = AetherAdoptSharedStateIntoPID(pid, dylibPath, adoptErr, sizeof(adoptErr));
+    if (arc != 0) {
+        AetherLogDaemon(@"[inject] handoff skipped: %s", adoptErr);
     }
     return 0;
-}
-
-// ============================================================================
-// 3. Socket Telemetry Monitor Thread (Root PF/Dummynet Fallback Companion)
-//    Runs as a background thread, uses libproc SPI (proc_pidfdinfo) to
-//    enumerate TCP/UDP sockets in the target process every 100ms.
-//    Provides real packet-flow visibility when dylib hooks can't inject.
-// ============================================================================
-
-static _Atomic(pid_t) gSocketMonitorActivePID = 0;
-
-static void *AetherSocketTelemetryThread(void *arg) {
-    pid_t targetPID = (pid_t)(intptr_t)arg;
-    AetherSharedState *state = AetherGetSharedState();
-    if (!state) {
-        aether_atomic_store(&gSocketMonitorActivePID, 0);
-        return NULL;
-    }
-
-    AetherLogDaemon(@"[socket-monitor] thread STARTED for pid %d", targetPID);
-
-    uint32_t lastTCPCount = 0, lastUDPCount = 0;
-    uint64_t totalTCPChanges = 0, totalUDPChanges = 0;
-    uint64_t pollCount = 0;
-
-    // Run while: shared state valid + no dylib hooks + this thread owns the PID
-    // Don't depend on hudVisible (HUD UI visibility) — socket monitor is a
-    // background telemetry fallback that should run whenever interception is
-    // active and no hook payload is injected.
-    while (state && aether_atomic_load(&gSocketMonitorActivePID) == targetPID) {
-        uint8_t currentMethod = aether_atomic_load(&state->injectionMethod);
-        if (currentMethod == 1) {  // Only Mach dylib hooks = full packet capture (method 1)
-            AetherLogDaemon(@"[socket-monitor] Mach hooks active (method=%u) — stopping monitor", currentMethod);
-            break;
-        }
-        // method 0=NECP only, 2=NECP only, 3=Root PF only, 4=NECP+PF → no dylib hooks, keep monitoring
-
-        pid_t currentPID = aether_atomic_load(&state->targetPID);
-        bool interception = aether_atomic_load(&state->interceptionActive);
-        if (currentPID != targetPID || !interception) {
-            usleep(500000);
-            continue;
-        }
-
-        // Enumerate sockets via proc_pidinfo with PROC_PIDLISTFDS
-        int bufSize = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, NULL, 0);
-        if (bufSize <= 0) {
-            if ((pollCount++ % 50) == 0) { // log every 5s
-                AetherLogDaemon(@"[socket-monitor] pid %d: proc_pidinfo(PROC_PIDLISTFDS) returned %d (errno=%d)", targetPID, bufSize, errno);
-            }
-            usleep(100000);
-            continue;
-        }
-
-        struct proc_fdinfo *fds = (struct proc_fdinfo *)malloc(bufSize);
-        if (!fds) {
-            usleep(100000);
-            continue;
-        }
-
-        int actual = proc_pidinfo(targetPID, PROC_PIDLISTFDS, 0, fds, bufSize);
-        if (actual <= 0) {
-            free(fds);
-            if ((pollCount++ % 50) == 0) {
-                AetherLogDaemon(@"[socket-monitor] pid %d: proc_pidinfo returned %d (errno=%d)", targetPID, actual, errno);
-            }
-            usleep(100000);
-            continue;
-        }
-
-        int fdCount = actual / sizeof(struct proc_fdinfo);
-        uint32_t tcpCount = 0, udpCount = 0;
-
-        for (int i = 0; i < fdCount; i++) {
-            if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET) continue;
-
-            struct aether_socket_fdinfo sinfo;
-            int rc = proc_pidfdinfo(targetPID, fds[i].proc_fd, PROC_PIDFDSOCKETINFO, &sinfo, sizeof(sinfo));
-            if (rc != sizeof(sinfo)) continue;
-
-            int family = sinfo.psi.soi_family;
-            if (family != AF_INET && family != AF_INET6) continue;
-
-            int sockType = sinfo.psi.soi_type;
-            if (sockType == SOCK_STREAM) tcpCount++;
-            else if (sockType == SOCK_DGRAM) udpCount++;
-            else continue;
-        }
-
-        free(fds);
-
-        if (tcpCount != lastTCPCount || udpCount != lastUDPCount) {
-            totalTCPChanges += (tcpCount != lastTCPCount) ? 1 : 0;
-            totalUDPChanges += (udpCount != lastUDPCount) ? 1 : 0;
-            AetherLogDaemon(@"[socket-monitor] pid %d: sockets CHANGED: TCP=%u UDP=%u (was TCP=%u UDP=%u)",
-                            targetPID, tcpCount, udpCount, lastTCPCount, lastUDPCount);
-            lastTCPCount = tcpCount;
-            lastUDPCount = udpCount;
-            aether_atomic_store(&state->activeTCPSockets, tcpCount);
-            aether_atomic_store(&state->activeUDPSockets, udpCount);
-        }
-
-        // Periodic heartbeat log every 10 seconds (100 polls * 100ms)
-        if ((pollCount++ % 100) == 0) {
-            AetherLogDaemon(@"[socket-monitor] pid %d: heartbeat — TCP=%u UDP=%u (total changes: TCP=%llu UDP=%llu)",
-                            targetPID, tcpCount, udpCount, totalTCPChanges, totalUDPChanges);
-        }
-
-        usleep(100000);
-    }
-
-    aether_atomic_store(&gSocketMonitorActivePID, 0);
-    AetherLogDaemon(@"[socket-monitor] thread EXITED for pid %d — total TCP changes=%llu, UDP changes=%llu",
-                    targetPID, totalTCPChanges, totalUDPChanges);
-    return NULL;
-}
-
-/// Spawn a socket telemetry monitor thread for root-engine-only mode.
-/// Prevents duplicate threads for the same PID.
-extern "C" void AetherStartBPFCaptureIfAvailable(void) {
-    AetherSharedState *state = AetherGetSharedState();
-    if (!state) return;
-
-    pid_t targetPID = aether_atomic_load(&state->targetPID);
-    if (targetPID <= 0) return;
-
-    // Prevent duplicate threads for same PID
-    pid_t current = aether_atomic_load(&gSocketMonitorActivePID);
-    if (current == targetPID) {
-        AetherLogDaemon(@"[socket-monitor] thread already running for pid %d, skipping", targetPID);
-        return;
-    }
-
-    pthread_t thr;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&thr, &attr, AetherSocketTelemetryThread, (void *)(intptr_t)targetPID) == 0) {
-        aether_atomic_store(&gSocketMonitorActivePID, targetPID);
-        AetherLogDaemon(@"[socket-monitor] telemetry thread SPAWNED for pid %d", targetPID);
-    } else {
-        AetherLogDaemon(@"[socket-monitor] thread spawn FAILED for pid %d (errno=%d)", targetPID, errno);
-    }
-    pthread_attr_destroy(&attr);
 }
